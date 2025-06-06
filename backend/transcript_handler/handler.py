@@ -7,12 +7,31 @@ import re
 import os
 from pathlib import Path
 
+# Add OpenAI import
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 class TranscriptHandler:
     def __init__(self):
         self.whisper_model = None
         self.supported_youtube_domains = ['youtube.com', 'youtu.be', 'm.youtube.com']
+        
+        # Initialize OpenAI client if available
+        self.openai_client = None
+        if OPENAI_AVAILABLE:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if api_key:
+                self.openai_client = openai.OpenAI(api_key=api_key)
+                logger.info("OpenAI Whisper API initialized")
+            else:
+                logger.warning("OPENAI_API_KEY not found, will use local Whisper only")
+        else:
+            logger.warning("OpenAI package not installed, will use local Whisper only")
     
     def _load_whisper_model(self, model_size: str = "base"):
         """Load Whisper model lazily"""
@@ -89,12 +108,20 @@ class TranscriptHandler:
             logger.error(f"Error extracting YouTube transcript: {str(e)}")
             raise
     
-    def transcribe_audio_file(self, audio_path: str, model_size: str = "base") -> List[Dict]:
-        """Transcribe audio file using Whisper"""
+    def transcribe_audio_file(self, audio_path: str, model_size: str = "base", prefer_openai: bool = True) -> List[Dict]:
+        """Transcribe audio file using OpenAI API or local Whisper"""
         try:
+            # Try OpenAI API first if available and preferred
+            if prefer_openai and self.openai_client:
+                try:
+                    return self._transcribe_with_openai_api(audio_path)
+                except Exception as e:
+                    logger.warning(f"OpenAI API failed, falling back to local Whisper: {str(e)}")
+            
+            # Fall back to local Whisper
             model = self._load_whisper_model(model_size)
             
-            logger.info(f"Transcribing audio file: {audio_path}")
+            logger.info(f"Transcribing audio file with local Whisper: {audio_path}")
             result = model.transcribe(audio_path)
             
             # Format transcript chunks
@@ -107,18 +134,18 @@ class TranscriptHandler:
                     "confidence": segment.get('confidence', 0.0)
                 })
             
-            logger.info(f"Successfully transcribed audio with {len(transcript_chunks)} segments")
+            logger.info(f"Successfully transcribed audio with local Whisper: {len(transcript_chunks)} segments")
             return transcript_chunks
             
         except Exception as e:
             logger.error(f"Error transcribing audio file: {str(e)}")
             raise
     
-    def transcribe_video_file(self, video_path: str, model_size: str = "base") -> List[Dict]:
-        """Transcribe video file using Whisper"""
+    def transcribe_video_file(self, video_path: str, model_size: str = "base", prefer_openai: bool = True) -> List[Dict]:
+        """Transcribe video file using OpenAI API or local Whisper"""
         try:
             # Whisper can handle video files directly
-            return self.transcribe_audio_file(video_path, model_size)
+            return self.transcribe_audio_file(video_path, model_size, prefer_openai)
             
         except Exception as e:
             logger.error(f"Error transcribing video file: {str(e)}")
@@ -257,4 +284,37 @@ class TranscriptHandler:
             
         except Exception as e:
             logger.error(f"Error chunking transcript: {str(e)}")
+            raise
+    
+    def _transcribe_with_openai_api(self, audio_path: str) -> List[Dict]:
+        """Transcribe audio using OpenAI Whisper API"""
+        if not self.openai_client:
+            raise ValueError("OpenAI API not available")
+        
+        try:
+            logger.info(f"Transcribing with OpenAI Whisper API: {audio_path}")
+            
+            with open(audio_path, "rb") as audio_file:
+                transcript = self.openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"]
+                )
+            
+            # Convert OpenAI response to our format
+            transcript_chunks = []
+            for segment in transcript.segments:
+                transcript_chunks.append({
+                    "text": segment["text"].strip(),
+                    "start_time": segment["start"],
+                    "end_time": segment["end"],
+                    "confidence": 1.0  # OpenAI doesn't provide confidence scores
+                })
+            
+            logger.info(f"OpenAI API transcription completed: {len(transcript_chunks)} segments")
+            return transcript_chunks
+            
+        except Exception as e:
+            logger.error(f"OpenAI API transcription failed: {str(e)}")
             raise

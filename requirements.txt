@@ -21,9 +21,12 @@ psycopg2-binary==2.9.9
 
 # Utilities
 python-dotenv==1.0.0
-pydantic==2.5.0
+pydantic>=2.6.0,<2.10.0
 httpx==0.25.2
 pathlib==1.0.1
+click>=8.0.2,<8.2.0
+filelock~=3.16.1
+psutil~=6.1.0
 
 # Background processing
 celery==5.3.4
