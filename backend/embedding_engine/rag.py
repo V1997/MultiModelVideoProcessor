@@ -9,6 +9,11 @@ import logging
 from pathlib import Path
 import json
 import re
+import warnings
+
+# Suppress Pydantic warnings from langchain/transformers
+warnings.filterwarnings("ignore", message="Field.*has conflict with protected namespace.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 # AI/ML imports
 try:

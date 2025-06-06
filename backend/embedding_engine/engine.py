@@ -11,6 +11,11 @@ from pathlib import Path
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import pickle
+import warnings
+
+# Suppress Pydantic warnings from transformers
+warnings.filterwarnings("ignore", message="Field.*has conflict with protected namespace.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 # Core ML libraries
 try:
@@ -39,13 +44,14 @@ class EmbeddingEngine:
     """
     
     def __init__(self, 
-                 text_model_name: str = "all-MiniLM-L6-v2",
-                 vision_model_name: str = "openai/clip-vit-base-patch32",
-                 vector_db_path: str = "./vector_db"):
+                 text_model_name: str = None,
+                 vision_model_name: str = None,
+                 vector_db_path: str = None):
         
-        self.text_model_name = text_model_name
-        self.vision_model_name = vision_model_name
-        self.vector_db_path = Path(vector_db_path)
+        # Use environment variables with fallback defaults
+        self.text_model_name = text_model_name or os.getenv("TEXT_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        self.vision_model_name = vision_model_name or os.getenv("VISION_EMBEDDING_MODEL", "openai/clip-vit-base-patch32")
+        self.vector_db_path = Path(vector_db_path or os.getenv("VECTOR_DB_PATH", "./vector_db"))
         self.vector_db_path.mkdir(exist_ok=True)
         
         # Initialize models

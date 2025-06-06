@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 import os
@@ -132,6 +132,11 @@ async def root():
         },
         "version": "2.0.0"
     }
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Return a simple favicon to prevent 404 errors"""
+    return Response(status_code=204)  # No Content - browser will use default
 
 @app.post("/upload-video", response_model=VideoUploadResponse)
 async def upload_video(
