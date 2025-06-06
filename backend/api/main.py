@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="MultiModel Video Processor API",
-    description="API for processing videos and generating transcripts - Phase 1",
-    version="1.0.0"
+    description="API for processing videos with AI-powered analysis, embeddings, and RAG - Phase 2",
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -69,11 +69,69 @@ class YouTubeProcessRequest(BaseModel):
     use_whisper: bool = False
     whisper_model: str = "base"
 
+# Phase 2 imports for embeddings and RAG
+try:
+    from backend.embedding_engine.engine import get_embedding_engine
+    from backend.embedding_engine.rag import get_rag_system
+    PHASE2_AVAILABLE = True
+except ImportError:
+    PHASE2_AVAILABLE = False
+    logger.warning("Phase 2 components not available. Install requirements for embedding and RAG features.")
+
+# Phase 2 Pydantic models
+class EmbeddingRequest(BaseModel):
+    video_ids: List[int]
+
+class EmbeddingStatus(BaseModel):
+    video_id: int
+    text_embeddings_count: int
+    frame_embeddings_count: int
+    status: str
+
+class SearchRequest(BaseModel):
+    query: str
+    video_ids: Optional[List[int]] = None
+    search_type: str = "both"  # "text", "frame", or "both"
+    max_results: int = 10
+
+class SearchResult(BaseModel):
+    query: str
+    results: List[dict]
+    total_results: int
+
+class RAGRequest(BaseModel):
+    query: str
+    video_ids: Optional[List[int]] = None
+    search_type: str = "both"
+    max_results: int = 10
+
+class RAGResponse(BaseModel):
+    query: str
+    response: str
+    context: List[dict]
+    video_ids: List[int]
+
+class VideoSummaryResponse(BaseModel):
+    video_id: int
+    video_filename: str
+    duration: float
+    summary: str
+    transcript_chunks: int
+    frames_extracted: int
+
 # API Routes
 
 @app.get("/")
 async def root():
-    return {"message": "MultiModel Video Processor API - Phase 1", "status": "running"}
+    return {
+        "message": "MultiModel Video Processor API - Phase 2", 
+        "status": "running",
+        "features": {
+            "phase_1": ["video_upload", "transcript_generation", "frame_extraction", "youtube_processing"],
+            "phase_2": ["vector_embeddings", "semantic_search", "multimodal_rag", "video_summarization"] if PHASE2_AVAILABLE else ["not_available"]
+        },
+        "version": "2.0.0"
+    }
 
 @app.post("/upload-video", response_model=VideoUploadResponse)
 async def upload_video(
@@ -308,6 +366,198 @@ async def list_videos(db: Session = Depends(get_db)):
         logger.error(f"Error listing videos: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ===============================
+# PHASE 2: VECTOR EMBEDDINGS & RAG API ENDPOINTS
+# ===============================
+
+@app.post("/api/v1/embeddings/generate", response_model=List[EmbeddingStatus])
+async def generate_embeddings(
+    request: EmbeddingRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """Generate embeddings for video content"""
+    if not PHASE2_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 2 features not available. Install embedding requirements.")
+    
+    try:
+        # Validate video IDs
+        valid_videos = []
+        for video_id in request.video_ids:
+            video = db.query(Video).filter(Video.id == video_id).first()
+            if video:
+                valid_videos.append(video_id)
+            else:
+                logger.warning(f"Video {video_id} not found")
+        
+        if not valid_videos:
+            raise HTTPException(status_code=400, detail="No valid video IDs provided")
+        
+        # Start background embedding generation
+        for video_id in valid_videos:
+            background_tasks.add_task(generate_embeddings_background, video_id)
+        
+        # Return initial status
+        results = []
+        for video_id in valid_videos:
+            results.append(EmbeddingStatus(
+                video_id=video_id,
+                text_embeddings_count=0,
+                frame_embeddings_count=0,
+                status="processing"
+            ))
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Error generating embeddings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/embeddings/status/{video_id}", response_model=EmbeddingStatus)
+async def get_embedding_status(video_id: int, db: Session = Depends(get_db)):
+    """Get embedding generation status for a video"""
+    if not PHASE2_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 2 features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Count existing embeddings (this is a simplified check)
+        transcript_count = db.query(TranscriptChunk).filter(TranscriptChunk.video_id == video_id).count()
+        frame_count = db.query(VideoFrame).filter(VideoFrame.video_id == video_id).count()
+        
+        return EmbeddingStatus(
+            video_id=video_id,
+            text_embeddings_count=transcript_count,
+            frame_embeddings_count=frame_count,
+            status="completed" if transcript_count > 0 or frame_count > 0 else "pending"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting embedding status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/search/semantic", response_model=SearchResult)
+async def semantic_search(request: SearchRequest):
+    """Perform semantic search across video content"""
+    if not PHASE2_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 2 features not available")
+    
+    try:
+        embedding_engine = await get_embedding_engine()
+        
+        # Generate query embedding
+        query_embedding = await embedding_engine.generate_text_embeddings([request.query])
+        
+        # Search for similar content
+        results = await embedding_engine.search_similar_content(
+            query_embedding[0],
+            content_type=request.search_type,
+            limit=request.max_results,
+            video_id=request.video_ids[0] if request.video_ids and len(request.video_ids) == 1 else None
+        )
+        
+        return SearchResult(
+            query=request.query,
+            results=results,
+            total_results=len(results)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in semantic search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/query/multimodal", response_model=RAGResponse)
+async def multimodal_query(request: RAGRequest):
+    """Ask questions about video content using RAG"""
+    if not PHASE2_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 2 features not available")
+    
+    try:
+        # Get OpenAI API key from environment
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        rag_system = await get_rag_system(openai_api_key)
+        
+        # Process the query
+        result = await rag_system.process_query(
+            query=request.query,
+            video_ids=request.video_ids,
+            search_type=request.search_type,
+            max_results=request.max_results
+        )
+        
+        return RAGResponse(
+            query=result["query"],
+            response=result["response"],
+            context=result["context"],
+            video_ids=result["video_ids"]
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in multimodal query: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/video/{video_id}/summary", response_model=VideoSummaryResponse)
+async def get_video_summary(video_id: int, db: Session = Depends(get_db)):
+    """Generate a comprehensive summary of a video"""
+    if not PHASE2_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 2 features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get OpenAI API key from environment
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        rag_system = await get_rag_system(openai_api_key)
+        
+        # Generate summary
+        summary_result = await rag_system.summarize_video(video_id)
+        
+        return VideoSummaryResponse(**summary_result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating video summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/similarity/find/{video_id}")
+async def find_similar_videos(video_id: int, limit: int = 5, db: Session = Depends(get_db)):
+    """Find videos similar to the given video"""
+    if not PHASE2_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 2 features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # This is a placeholder for video-to-video similarity
+        # In full implementation, you would:
+        # 1. Get the average embedding for the video
+        # 2. Search for similar videos using that embedding
+        # 3. Return ranked results
+        
+        return {
+            "video_id": video_id,
+            "similar_videos": [],
+            "message": "Video similarity feature coming soon"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error finding similar videos: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Background processing functions
 async def process_video_background(video_id: int, video_path: str):
     """Background task to process uploaded video"""
@@ -412,6 +662,17 @@ async def process_youtube_background(video_id: int, video_url: str, use_whisper:
         db.commit()
     finally:
         db.close()
+
+# Background task for embedding generation
+async def generate_embeddings_background(video_id: int):
+    """Background task to generate embeddings for a video"""
+    try:
+        embedding_engine = await get_embedding_engine()
+        await embedding_engine.process_video_embeddings(video_id)
+        logger.info(f"Completed embedding generation for video {video_id}")
+        
+    except Exception as e:
+        logger.error(f"Error in background embedding generation for video {video_id}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
