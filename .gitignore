@@ -89,3 +89,27 @@ temp/
 *.pb
 *.onnx
 *.tflite
+
+# MultiModelVideo specific
+nul
+uploads/
+processed/
+frames/
+vector_db/
+postgres_data/
+
+# Audio files
+*.mp3
+*.wav
+*.webm
+
+# Database files
+*.db
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.temp
+
+# API configuration (keep template, exclude production)
+config/production.py

@@ -12,7 +12,9 @@ Pillow==10.1.0
 # Audio/Speech processing
 openai-whisper==20231117
 youtube-transcript-api==0.6.1
-yt-dlp==2023.11.16
+google-api-python-client==2.110.0  # YouTube Data API for video search
+isodate==0.6.1  # For parsing ISO 8601 duration format
+yt-dlp>=2024.12.13  # Latest version for better YouTube support
 
 # Database
 sqlalchemy==2.0.23
@@ -47,7 +49,28 @@ scikit-learn==1.3.2
 # OpenAI for GPT models
 openai==1.3.7
 
+# Phase 3: Conversational Interface
+spacy==3.7.2
+nltk==3.8.1
+textblob==0.17.1
+
+# Phase 4: Visual Search Engine  
+ultralytics==8.0.196
+detectron2 @ git+https://github.com/facebookresearch/detectron2.git
+clip-by-openai==1.0
+
+# Phase 5: Navigation & User Interface
+plotly==5.17.0
+matplotlib==3.8.2
+seaborn==0.13.0
+
+# Additional ML/AI dependencies
+accelerate==0.25.0
+datasets==2.15.0
+evaluate==0.4.1
+
 # Development
 pytest==7.4.3
+pytest-asyncio==0.21.1
 pytest-asyncio==0.21.1
 black==23.11.0

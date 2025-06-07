@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Frontend Connection</title>
+</head>
+<body>
+    <h1>Test YouTube Search Connection</h1>
+    <button onclick="testYouTubeSearch()">Test YouTube Search</button>
+    <div id="results"></div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000';
+        
+        async function testYouTubeSearch() {
+            console.log('🔍 Testing YouTube search...');
+            const resultsDiv = document.getElementById('results');
+            
+            try {
+                const requestBody = {
+                    query: 'javascript tutorial',
+                    max_results: 3,
+                    order: 'relevance'
+                };
+                
+                console.log('📤 Request URL:', `${API_BASE}/api/v1/youtube/search`);
+                console.log('📤 Request body:', requestBody);
+
+                const response = await fetch(`${API_BASE}/api/v1/youtube/search`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestBody)
+                });
+
+                console.log('📥 Response status:', response.status);
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('❌ Error response:', errorText);
+                    throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+                }
+
+                const data = await response.json();
+                console.log('✅ Response data:', data);
+                
+                resultsDiv.innerHTML = `
+                    <h2>Success!</h2>
+                    <p>Found ${data.videos ? data.videos.length : 0} videos</p>
+                    <pre>${JSON.stringify(data, null, 2)}</pre>
+                `;
+                
+            } catch (error) {
+                console.error('❌ Test failed:', error);
+                resultsDiv.innerHTML = `
+                    <h2>Error!</h2>
+                    <p style="color: red;">${error.message}</p>
+                `;
+            }
+        }
+    </script>
+</body>
+</html>

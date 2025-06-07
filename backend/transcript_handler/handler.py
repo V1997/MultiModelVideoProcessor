@@ -16,11 +16,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 class TranscriptHandler:
     def __init__(self):
         self.whisper_model = None
-        self.supported_youtube_domains = ['youtube.com', 'youtu.be', 'm.youtube.com']
-        
+        self.supported_youtube_domains = [
+    'youtube.com', 'youtu.be', 'm.youtube.com']
+
         # Initialize OpenAI client if available
         self.openai_client = None
         if OPENAI_AVAILABLE:
@@ -29,46 +31,51 @@ class TranscriptHandler:
                 self.openai_client = openai.OpenAI(api_key=api_key)
                 logger.info("OpenAI Whisper API initialized")
             else:
-                logger.warning("OPENAI_API_KEY not found, will use local Whisper only")
+                logger.warning(
+                    "OPENAI_API_KEY not found, will use local Whisper only")
         else:
-            logger.warning("OpenAI package not installed, will use local Whisper only")
-    
+            logger.warning(
+                "OpenAI package not installed, will use local Whisper only")
+
     def _load_whisper_model(self, model_size: str = "base"):
         """Load Whisper model lazily"""
         if self.whisper_model is None:
             logger.info(f"Loading Whisper model: {model_size}")
             self.whisper_model = whisper.load_model(model_size)
         return self.whisper_model
-    
+
     def is_youtube_url(self, url: str) -> bool:
         """Check if URL is a YouTube URL"""
-        return any(domain in url.lower() for domain in self.supported_youtube_domains)
-    
+        return any(domain in url.lower()
+                   for domain in self.supported_youtube_domains)
+
     def extract_youtube_video_id(self, url: str) -> Optional[str]:
         """Extract video ID from YouTube URL"""
         patterns = [
             r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([^&\n?#]+)',
             r'youtube\.com/watch\?.*v=([^&\n?#]+)'
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, url)
             if match:
                 return match.group(1)
         return None
-    
-    def get_youtube_transcript(self, video_url: str) -> Tuple[List[Dict], Dict]:
+
+    def get_youtube_transcript(
+        self, video_url: str) -> Tuple[List[Dict], Dict]:
         """Get transcript from YouTube video"""
         try:
             video_id = self.extract_youtube_video_id(video_url)
             if not video_id:
                 raise ValueError("Could not extract video ID from YouTube URL")
-            
-            logger.info(f"Extracting transcript for YouTube video ID: {video_id}")
-            
+
+            logger.info(
+                f"Extracting transcript for YouTube video ID: {video_id}")
+
             # Get transcript
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-            
+
             # Format transcript chunks
             transcript_chunks = []
             for entry in transcript_list:
@@ -78,17 +85,17 @@ class TranscriptHandler:
                     "end_time": entry['start'] + entry['duration'],
                     "confidence": 1.0  # YouTube transcripts don't provide confidence scores
                 })
-            
+
             # Get video metadata using yt-dlp
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'extractflat': False,
             }
-            
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_url, download=False)
-                
+
                 metadata = {
                     "duration": info.get('duration', 0),
                     "title": info.get('title', ''),
@@ -100,15 +107,20 @@ class TranscriptHandler:
                     "height": info.get('height', 0),
                     "fps": info.get('fps', 0),
                 }
-            
-            logger.info(f"Successfully extracted transcript with {len(transcript_chunks)} chunks")
+
+            logger.info(
+                f"Successfully extracted transcript with {len(transcript_chunks)} chunks")
             return transcript_chunks, metadata
-            
+
         except Exception as e:
             logger.error(f"Error extracting YouTube transcript: {str(e)}")
             raise
-    
-    def transcribe_audio_file(self, audio_path: str, model_size: str = "base", prefer_openai: bool = True) -> List[Dict]:
+
+    def transcribe_audio_file(
+    self,
+    audio_path: str,
+    model_size: str = "base",
+     prefer_openai: bool = True) -> List[Dict]:
         """Transcribe audio file using OpenAI API or local Whisper"""
         try:
             # Try OpenAI API first if available and preferred
@@ -116,20 +128,21 @@ class TranscriptHandler:
                 try:
                     return self._transcribe_with_openai_api(audio_path)
                 except Exception as e:
-                    logger.warning(f"OpenAI API failed, falling back to local Whisper: {str(e)}")
-            
+                    logger.warning(
+                        f"OpenAI API failed, falling back to local Whisper: {str(e)}")
+
             # Fall back to local Whisper
             model = self._load_whisper_model(model_size)
-            
-            logger.info(f"Transcribing audio file with local Whisper: {audio_path}")
+
+            logger.info(
+                f"Transcribing audio file with local Whisper: {audio_path}")
             result = model.transcribe(audio_path)
-            
+
             # Format transcript chunks
             transcript_chunks = []
             for segment in result['segments']:
                 transcript_chunks.append({
-                    "text": segment['text'].strip(),
-                    "start_time": segment['start'],
+                    "text": segment['text'].strip(),                "start_time": segment['start'],
                     "end_time": segment['end'],
                     "confidence": segment.get('confidence', 0.0)
                 })
@@ -152,7 +165,7 @@ class TranscriptHandler:
             raise
     
     def download_youtube_audio(self, video_url: str, output_dir: str = "./temp") -> str:
-        """Download audio from YouTube video for transcription"""
+        """Download audio from YouTube video for transcription with enhanced anti-bot protection"""
         try:
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
@@ -161,6 +174,7 @@ class TranscriptHandler:
             audio_filename = f"youtube_audio_{video_id}.%(ext)s"
             audio_filepath = output_path / audio_filename
             
+            # Enhanced yt-dlp options to bypass YouTube's anti-bot measures
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': str(audio_filepath),
@@ -171,16 +185,55 @@ class TranscriptHandler:
                 }],
                 'quiet': True,
                 'no_warnings': True,
+                # Enhanced headers to avoid 403 errors
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-us,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Referer': 'https://www.youtube.com/',
+                },
+                # Additional options for robustness
+                'socket_timeout': 30,
+                'retries': 3,
+                'fragment_retries': 3,
+                'extractor_retries': 3,
+                'file_access_retries': 3,
+                'sleep_interval': 1,
+                'max_sleep_interval': 5,
             }
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
+            # First attempt with enhanced options
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([video_url])
+            except Exception as first_error:
+                logger.warning(f"First download attempt failed: {str(first_error)}")
+                
+                # Fallback: try with different format selection for 403 errors
+                if "403" in str(first_error) or "Forbidden" in str(first_error):
+                    logger.info("Attempting fallback format selection for 403 error")
+                    fallback_opts = ydl_opts.copy()
+                    fallback_opts['format'] = 'worst[ext=m4a]/worst[ext=mp4]/worst'
+                    
+                    try:
+                        with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                            ydl.download([video_url])
+                    except Exception as fallback_error:
+                        logger.error(f"Fallback download also failed: {str(fallback_error)}")
+                        raise first_error
+                else:
+                    raise first_error
             
             # Find the downloaded file (extension might change)
             downloaded_files = list(output_path.glob(f"youtube_audio_{video_id}.*"))
             if not downloaded_files:
                 raise FileNotFoundError("Could not find downloaded audio file")
             
+            logger.info(f"Successfully downloaded YouTube audio: {downloaded_files[0]}")
             return str(downloaded_files[0])
             
         except Exception as e:

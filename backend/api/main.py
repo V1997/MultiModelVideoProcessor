@@ -7,9 +7,13 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 import shutil
+from dotenv import load_dotenv
 
 import sys
 from pathlib import Path
+
+# Load environment variables
+load_dotenv()
 
 # Add the project root to the Python path
 project_root = Path(__file__).parent.parent.parent
@@ -69,6 +73,102 @@ class YouTubeProcessRequest(BaseModel):
     use_whisper: bool = False
     whisper_model: str = "base"
 
+class YouTubeSearchRequest(BaseModel):
+    query: str
+    max_results: int = 10
+    duration: Optional[str] = None  # short, medium, long
+    order: str = "relevance"  # relevance, date, rating, viewCount
+
+class YouTubeVideoInfo(BaseModel):
+    video_id: str
+    title: str
+    description: str
+    thumbnail_url: str
+    duration: str
+    view_count: int
+    published_at: str
+    channel_title: str
+    url: str
+
+class EmbeddingRequest(BaseModel):
+    video_id: int
+    chunk_size: int = 1000
+    overlap: int = 200
+
+class EmbeddingStatus(BaseModel):
+    video_id: int
+    status: str
+    chunks_processed: int
+    total_chunks: int
+    progress: float
+
+class SearchResult(BaseModel):
+    video_id: int
+    chunk_text: str
+    timestamp: Optional[float]
+    similarity_score: float
+
+class SearchRequest(BaseModel):
+    query: str
+    video_id: Optional[int] = None
+    top_k: int = 5
+
+class RAGRequest(BaseModel):
+    query: str
+    video_id: int
+    include_visual: bool = False
+
+class ChatSessionCreate(BaseModel):
+    video_id: str
+    title: Optional[str] = None
+
+class ChatMessageRequest(BaseModel):
+    session_id: str
+    message: str
+
+class VisualSearchRequest(BaseModel):
+    video_id: int
+    query: str
+    confidence_threshold: float = 0.3
+
+class RAGResponse(BaseModel):
+    answer: str
+    confidence: float
+    sources: List[str]
+    timestamp_citations: List[dict]
+
+class VideoSummaryResponse(BaseModel):
+    video_id: int
+    summary: str
+    key_topics: List[str]
+    duration_summary: str
+
+class ChatSessionResponse(BaseModel):
+    session_id: str
+    video_id: str
+    status: str
+
+class ChatMessageResponse(BaseModel):
+    message_id: str
+    response: str
+    confidence: float
+    timestamp_citations: List[dict]
+
+class VisualSearchResponse(BaseModel):
+    video_id: str
+    results: List[dict]
+    total_matches: int
+
+class TopicSegmentResponse(BaseModel):
+    video_id: str
+    segments: List[dict]
+    total_segments: int
+
+class ContentOutlineResponse(BaseModel):
+    video_id: str
+    outline: dict
+    chapters: List[dict]
+
 # Phase 2 imports for embeddings and RAG
 try:
     from backend.embedding_engine.engine import get_embedding_engine
@@ -78,59 +178,167 @@ except ImportError:
     PHASE2_AVAILABLE = False
     logger.warning("Phase 2 components not available. Install requirements for embedding and RAG features.")
 
-# Phase 2 Pydantic models
-class EmbeddingRequest(BaseModel):
-    video_ids: List[int]
+# =============================================================================
+# PHASE 3-5 API ENDPOINTS: Chat, Visual Search, Content Segmentation
+# =============================================================================
 
-class EmbeddingStatus(BaseModel):
-    video_id: int
-    text_embeddings_count: int
-    frame_embeddings_count: int
-    status: str
+try:
+    from backend.conversation.manager import ConversationManager
+    from backend.visual_search.engine import VisualSearchEngine
+    from backend.content_analysis.segmentation import ContentSegmentationEngine
+    from backend.embedding_engine.rag import get_rag_system
+    PHASE3_TO_5_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Phase 3-5 features not available: {e}")
+    PHASE3_TO_5_AVAILABLE = False
 
-class SearchRequest(BaseModel):
-    query: str
-    video_ids: Optional[List[int]] = None
-    search_type: str = "both"  # "text", "frame", or "both"
-    max_results: int = 10
+# Initialize Phase 3-5 components
+conversation_manager = None
+visual_search_engine = None
+content_segmentation_engine = None
 
-class SearchResult(BaseModel):
-    query: str
-    results: List[dict]
-    total_results: int
+@app.on_event("startup")
+async def initialize_phase3_to_5():
+    """Initialize Phase 3-5 components"""
+    global conversation_manager, visual_search_engine, content_segmentation_engine
+    
+    if PHASE3_TO_5_AVAILABLE:
+        try:
+            # Initialize RAG system
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            rag_system = await get_rag_system(openai_api_key)
+            
+            # Initialize components
+            conversation_manager = ConversationManager(rag_system)
+            visual_search_engine = VisualSearchEngine()
+            content_segmentation_engine = ContentSegmentationEngine()
+            
+            logger.info("Phase 3-5 components initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Phase 3-5 components: {e}")
 
-class RAGRequest(BaseModel):
-    query: str
-    video_ids: Optional[List[int]] = None
-    search_type: str = "both"
-    max_results: int = 10
+# Chat Session Endpoints
+@app.post("/api/v1/chat/sessions")
+async def create_chat_session(video_id: int, title: Optional[str] = None, db: Session = Depends(get_db)):
+    """Create a new chat session for a video"""
+    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
+        raise HTTPException(status_code=501, detail="Chat features not available")
+    
+    try:
+        session = conversation_manager.create_session(db, video_id, title)
+        return {
+            "session_id": session.session_id,
+            "video_id": session.video_id,
+            "title": session.title,
+            "created_at": session.created_at
+        }
+    except Exception as e:
+        logger.error(f"Error creating chat session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-class RAGResponse(BaseModel):
-    query: str
-    response: str
-    context: List[dict]
-    video_ids: List[int]
+@app.get("/api/v1/chat/sessions/{session_id}")
+async def get_chat_session(session_id: str, db: Session = Depends(get_db)):
+    """Get chat session details"""
+    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
+        raise HTTPException(status_code=501, detail="Chat features not available")
+    
+    try:
+        session = conversation_manager.get_session(db, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        return {
+            "session_id": session.session_id,
+            "video_id": session.video_id,
+            "title": session.title,
+            "created_at": session.created_at
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting chat session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-class VideoSummaryResponse(BaseModel):
-    video_id: int
-    video_filename: str
-    duration: float
-    summary: str
-    transcript_chunks: int
-    frames_extracted: int
+# Visual Search Endpoints
+@app.post("/api/v1/visual-search/detect-objects")
+async def detect_objects_endpoint(video_id: int, frame_path: str, confidence_threshold: float = 0.5, db: Session = Depends(get_db)):
+    """Detect objects in a video frame"""
+    if not PHASE3_TO_5_AVAILABLE or not visual_search_engine:
+        raise HTTPException(status_code=501, detail="Visual search features not available")
+    
+    try:
+        results = visual_search_engine.detect_objects_in_frame(frame_path, confidence_threshold)
+        return {"objects": results, "frame_path": frame_path}
+    except Exception as e:
+        logger.error(f"Error detecting objects: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# API Routes
+@app.post("/api/v1/visual-search/search/{video_id}")
+async def visual_search_endpoint(video_id: int, request: VisualSearchRequest, db: Session = Depends(get_db)):
+    """Search for visual content using natural language"""
+    if not PHASE3_TO_5_AVAILABLE or not visual_search_engine:
+        raise HTTPException(status_code=501, detail="Visual search features not available")
+    
+    try:
+        results = visual_search_engine.search_visual_content(db, video_id, request.query)
+        return {"query": request.query, "results": results}
+    except Exception as e:
+        logger.error(f"Error in visual search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Content Segmentation Endpoints
+@app.post("/api/v1/content/analyze-topics")
+async def analyze_topics_endpoint(video_id: int, db: Session = Depends(get_db)):
+    """Analyze video transcript to identify topic segments"""
+    if not PHASE3_TO_5_AVAILABLE or not content_segmentation_engine:
+        raise HTTPException(status_code=501, detail="Content analysis features not available")
+    
+    try:
+        results = content_segmentation_engine.analyze_transcript_topics(db, video_id)
+        return {"video_id": video_id, "topics": results}
+    except Exception as e:
+        logger.error(f"Error analyzing topics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/content/generate-outline")
+async def generate_outline_endpoint(video_id: int, db: Session = Depends(get_db)):
+    """Generate content outline for video navigation"""
+    if not PHASE3_TO_5_AVAILABLE or not content_segmentation_engine:
+        raise HTTPException(status_code=501, detail="Content analysis features not available")
+    
+    try:
+        outline = content_segmentation_engine.generate_content_outline(db, video_id)
+        return {"video_id": video_id, "outline": outline}
+    except Exception as e:
+        logger.error(f"Error generating outline: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/content/navigation/{video_id}")
+async def get_navigation_data(video_id: int, db: Session = Depends(get_db)):
+    """Get navigation data for video player"""
+    if not PHASE3_TO_5_AVAILABLE or not content_segmentation_engine:
+        raise HTTPException(status_code=501, detail="Content analysis features not available")
+    
+    try:
+        nav_data = content_segmentation_engine.get_video_navigation_data(db, video_id)
+        return nav_data
+    except Exception as e:
+        logger.error(f"Error getting navigation data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
     return {
-        "message": "MultiModel Video Processor API - Phase 2", 
+        "message": "MultiModel Video Processor API - Phase 3-5", 
         "status": "running",
         "features": {
             "phase_1": ["video_upload", "transcript_generation", "frame_extraction", "youtube_processing"],
-            "phase_2": ["vector_embeddings", "semantic_search", "multimodal_rag", "video_summarization"] if PHASE2_AVAILABLE else ["not_available"]
+            "phase_2": ["vector_embeddings", "semantic_search", "multimodal_rag", "video_summarization"] if PHASE2_AVAILABLE else ["not_available"],
+            "phase_3": ["conversational_interface", "context_aware_chat", "timestamp_citations"] if PHASE3_TO_5_AVAILABLE else ["not_available"],
+            "phase_4": ["visual_search", "object_detection", "scene_classification"] if PHASE3_TO_5_AVAILABLE else ["not_available"],
+            "phase_5": ["content_segmentation", "auto_outlines", "navigation_events"] if PHASE3_TO_5_AVAILABLE else ["not_available"]
         },
-        "version": "2.0.0"
+        "version": "3.0.0"
     }
 
 @app.get("/favicon.ico")
@@ -256,6 +464,50 @@ async def process_youtube_video(
         
     except Exception as e:
         logger.error(f"Error processing YouTube video: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/youtube/search")
+async def search_youtube_videos(request: YouTubeSearchRequest):
+    """Search YouTube videos using the YouTube Data API"""
+    try:
+        from backend.youtube_search.service import YouTubeSearchService
+        
+        search_service = YouTubeSearchService()
+        results = search_service.search_videos(
+            query=request.query,
+            max_results=request.max_results,
+            duration=request.duration,
+            order=request.order
+        )
+        
+        return {
+            "query": request.query,
+            "total_results": len(results),
+            "videos": [YouTubeVideoInfo(**video) for video in results]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error searching YouTube videos: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/youtube/info")
+async def get_youtube_video_info(url: str):
+    """Get information about a specific YouTube video"""
+    try:
+        from backend.youtube_search.service import YouTubeSearchService
+        
+        search_service = YouTubeSearchService()
+        video_info = search_service.get_video_info(url)
+        
+        if not video_info:
+            raise HTTPException(status_code=404, detail="Video not found or invalid URL")
+        
+        return YouTubeVideoInfo(**video_info)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting YouTube video info: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/video/{video_id}/status", response_model=VideoProcessingStatus)
@@ -563,6 +815,87 @@ async def find_similar_videos(video_id: int, limit: int = 5, db: Session = Depen
         logger.error(f"Error finding similar videos: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ===============================
+# PHASE 3-5: ADVANCED FEATURES API ENDPOINTS
+# ===============================
+
+@app.post("/api/v1/conversation/start", response_model=dict)
+async def start_conversation(video_id: int, db: Session = Depends(get_db)):
+    """Start a new conversation session for a video"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
+    
+    try:
+        # Initialize conversation manager
+        if conversation_manager is None:
+            raise HTTPException(status_code=500, detail="Conversation manager not available")
+        
+        # Start a new session
+        session_id = conversation_manager.start_session(video_id)
+        
+        return {"session_id": session_id, "status": "started"}
+        
+    except Exception as e:
+        logger.error(f"Error starting conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/conversation/{session_id}/ask", response_model=dict)
+async def ask_question(session_id: str, request: dict):
+    """Ask a question in the conversation"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
+    
+    try:
+        if conversation_manager is None:
+            raise HTTPException(status_code=500, detail="Conversation manager not available")
+        
+        # Process the question
+        response = conversation_manager.process_question(session_id, request["question"])
+        
+        return {"response": response}
+        
+    except Exception as e:
+        logger.error(f"Error in conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/visual-search", response_model=dict)
+async def visual_search(request: dict):
+    """Perform visual search for a video"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
+    
+    try:
+        if visual_search_engine is None:
+            raise HTTPException(status_code=500, detail="Visual search engine not available")
+        
+        # Perform the visual search
+        results = visual_search_engine.search(request["image_path"], request.get("top_k", 5))
+        
+        return {"results": results}
+        
+    except Exception as e:
+        logger.error(f"Error in visual search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/content-navigation", response_model=dict)
+async def content_navigation(request: dict):
+    """Navigate and segment video content"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
+    
+    try:
+        if content_segmentation_engine is None:
+            raise HTTPException(status_code=500, detail="Content segmentation engine not available")
+        
+        # Segment the content
+        segments = content_segmentation_engine.segment(request["video_id"], request.get("threshold", 0.5))
+        
+        return {"segments": segments}
+        
+    except Exception as e:
+        logger.error(f"Error in content navigation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Background processing functions
 async def process_video_background(video_id: int, video_path: str):
     """Background task to process uploaded video"""
@@ -678,6 +1011,303 @@ async def generate_embeddings_background(video_id: int):
         
     except Exception as e:
         logger.error(f"Error in background embedding generation for video {video_id}: {e}")
+
+# ===============================
+# PHASE 3: CONVERSATIONAL INTERFACE API ENDPOINTS
+# ===============================
+
+@app.post("/api/v1/chat/session", response_model=ChatSessionResponse)
+async def create_chat_session(request: ChatSessionCreate, db: Session = Depends(get_db)):
+    """Create a new chat session for a video"""
+    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
+        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == request.video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        session = conversation_manager.create_session(db, request.video_id, request.title)
+        
+        return ChatSessionResponse(
+            session_id=session.session_id,
+            video_id=session.video_id,
+            title=session.title,
+            created_at=session.created_at.isoformat()
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating chat session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/chat/message", response_model=ChatMessageResponse)
+async def send_chat_message(request: ChatMessageRequest, db: Session = Depends(get_db)):
+    """Send a message in a chat session and get AI response"""
+    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
+        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
+    
+    try:
+        session = conversation_manager.get_session(db, request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Chat session not found")
+        
+        response = await conversation_manager.generate_enhanced_response(
+            db, request.session_id, request.message, session.video_id
+        )
+        
+        return ChatMessageResponse(**response)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing chat message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/chat/session/{session_id}/history")
+async def get_chat_history(session_id: str, db: Session = Depends(get_db)):
+    """Get complete chat session history"""
+    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
+        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
+    
+    try:
+        history = conversation_manager.get_session_history(db, session_id)
+        if not history:
+            raise HTTPException(status_code=404, detail="Chat session not found")
+        
+        return history
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting chat history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/chat/session/{session_id}")
+async def close_chat_session(session_id: str, db: Session = Depends(get_db)):
+    """Close a chat session"""
+    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
+        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
+    
+    try:
+        conversation_manager.close_session(db, session_id)
+        return {"message": "Chat session closed successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error closing chat session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ===============================
+# PHASE 4: VISUAL SEARCH ENGINE API ENDPOINTS
+# ===============================
+
+@app.post("/api/v1/visual/process/{video_id}")
+async def process_video_visual_content(
+    video_id: int, 
+    background_tasks: BackgroundTasks,
+    confidence_threshold: float = 0.5,
+    db: Session = Depends(get_db)
+):
+    """Process video frames for object detection and scene classification"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Start background processing
+        background_tasks.add_task(
+            process_visual_content_background, video_id, confidence_threshold
+        )
+        
+        return {
+            "video_id": video_id,
+            "status": "processing",
+            "message": "Visual content processing started in background"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting visual content processing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/visual/search", response_model=VisualSearchResponse)
+async def visual_search(request: VisualSearchRequest, db: Session = Depends(get_db)):
+    """Search for visual content using natural language queries"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == request.video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        search_results = visual_search_engine.search_visual_content(
+            db, request.video_id, request.query, request.confidence_threshold
+        )
+        
+        # Format response to match VisualSearchResponse model
+        formatted_response = {
+            "video_id": str(request.video_id),
+            "results": search_results.get("results", []),
+            "total_matches": search_results.get("total_results", 0)
+        }
+        
+        return VisualSearchResponse(**formatted_response)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in visual search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/visual/{video_id}/timeline")
+async def get_visual_timeline(video_id: int, db: Session = Depends(get_db)):
+    """Get visual timeline showing detected objects and scenes"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        timeline = visual_search_engine.get_visual_timeline(db, video_id)
+        return timeline
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting visual timeline: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/visual/{video_id}/statistics")
+async def get_object_statistics(video_id: int, db: Session = Depends(get_db)):
+    """Get statistics about detected objects in the video"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        stats = visual_search_engine.get_object_statistics(db, video_id)
+        return stats
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting object statistics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ===============================
+# PHASE 5: NAVIGATION & USER INTERFACE API ENDPOINTS
+# ===============================
+
+@app.post("/api/v1/content/analyze/{video_id}", response_model=TopicSegmentResponse)
+async def analyze_video_content(video_id: int, db: Session = Depends(get_db)):
+    """Analyze video content to create topic segments"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 5 content analysis features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        result = content_segmentation_engine.create_topic_segments(db, video_id)
+        
+        return TopicSegmentResponse(**result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error analyzing video content: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/content/outline/{video_id}", response_model=ContentOutlineResponse)
+async def generate_content_outline(video_id: int, db: Session = Depends(get_db)):
+    """Generate hierarchical content outline for the video"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 5 content analysis features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        result = content_segmentation_engine.generate_content_outline(db, video_id)
+        
+        return ContentOutlineResponse(**result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating content outline: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/navigation/events/{video_id}")
+async def create_navigation_events(video_id: int, db: Session = Depends(get_db)):
+    """Create navigation events for enhanced video navigation"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 5 navigation features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        result = content_segmentation_engine.create_navigation_events(db, video_id)
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating navigation events: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/navigation/{video_id}")
+async def get_navigation_data(video_id: int, db: Session = Depends(get_db)):
+    """Get comprehensive navigation data for a video"""
+    if not PHASE3_TO_5_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Phase 5 navigation features not available")
+    
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        navigation_data = content_segmentation_engine.get_video_navigation_data(db, video_id)
+        
+        return navigation_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting navigation data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Background processing functions for Phase 4
+async def process_visual_content_background(video_id: int, confidence_threshold: float):
+    """Background task to process visual content of a video"""
+    db = next(get_db())
+    try:
+        logger.info(f"Starting visual content processing for video {video_id}")
+        
+        result = visual_search_engine.process_video_frames(db, video_id, confidence_threshold)
+        
+        logger.info(f"Completed visual content processing for video {video_id}: {result}")
+        
+    except Exception as e:
+        logger.error(f"Error in visual content processing for video {video_id}: {e}")
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn
