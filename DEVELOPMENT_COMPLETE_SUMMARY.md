@@ -124,7 +124,7 @@ Success Rate: 100.0%
 - **TopicSegment**: Content segmentation data
 
 ### Environment Configuration
-- **YouTube API Key**: Real API key configured (AIzaSyBEiXs3swlIlXsK0a_ELAO9dc7-Nn5r-u4)
+- **YouTube API Key**: Real API key configured
 - **OpenAI API**: GPT models and Whisper integration
 - **Database**: PostgreSQL connection string configured
 - **Redis**: Caching and session storage ready
