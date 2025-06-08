@@ -286,3 +286,88 @@ tail -f /var/log/multimodel-video.log
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Redis Integration (Enhanced Performance)
+
+The system now includes Redis integration for improved performance through caching and background task management.
+
+### Redis Setup
+
+1. **Install Redis:**
+   - **Windows:** Download from https://github.com/microsoftarchive/redis/releases
+   - **macOS:** `brew install redis`
+   - **Ubuntu:** `sudo apt install redis-server`
+
+2. **Configure Redis:**
+   ```bash
+   # Add to your .env file
+   REDIS_URL=redis://localhost:6379
+   ```
+
+3. **Quick Setup:**
+   ```bash
+   python setup_redis.py
+   ```
+
+### Background Task Processing
+
+The system uses Celery with Redis for background processing:
+
+1. **Start Redis server** (if not already running)
+
+2. **Start Celery worker:**
+   ```bash
+   python start_celery_worker.py
+   ```
+
+3. **Start the API server:**
+   ```bash
+   uvicorn backend.api.main:app --reload
+   ```
+
+### Enhanced Features with Redis
+
+- **Session Caching**: Faster conversation retrieval
+- **Response Caching**: Cached responses for identical queries
+- **Video Data Caching**: Cached transcripts and frames
+- **Background Processing**: Non-blocking video processing
+- **Task Monitoring**: Real-time task status tracking
+
+### Monitoring and Testing
+
+- **Check system status:**
+  ```bash
+  python check_system_status.py
+  ```
+
+- **Test Redis integration:**
+  ```bash
+  python test_redis_integration.py
+  ```
+
+### New API Endpoints (Redis)
+
+#### Health and Monitoring
+- `GET /health` - Overall system health
+- `GET /redis/status` - Redis connection and statistics
+- `POST /redis/cache/clear` - Clear cache
+
+#### Task Management
+- `GET /task/{task_id}` - Get task status
+- `DELETE /task/{task_id}` - Cancel task
+- `GET /tasks/active` - List active tasks
+
+#### Enhanced Uploads (with task tracking)
+- `POST /upload-video` - Returns task ID for monitoring
+- `POST /process-youtube` - Returns task ID for monitoring
+- `POST /api/v1/embeddings/generate` - Returns task ID
+- `POST /api/v1/visual/process/{video_id}` - Returns task ID
+
+### Fallback Mode
+
+If Redis is not available, the system automatically falls back to:
+- In-memory session storage
+- FastAPI BackgroundTasks for processing
+- Direct database queries (no caching)
+
+This ensures the system remains functional even without Redis.

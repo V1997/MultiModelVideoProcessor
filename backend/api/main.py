@@ -6,6 +6,7 @@ import uuid
 import logging
 from pathlib import Path
 from typing import List, Optional
+from datetime import datetime
 import shutil
 from dotenv import load_dotenv
 
@@ -22,6 +23,9 @@ sys.path.insert(0, str(project_root))
 from backend.database.models import get_db, create_tables, Video, TranscriptChunk, VideoFrame
 from backend.video_processor.processor import VideoProcessor, is_supported_format
 from backend.transcript_handler.handler import TranscriptHandler
+from backend.services.redis_service import get_redis_service, is_redis_available
+from backend.services.celery_app import celery_app
+from backend.services.websocket_service import get_websocket_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,9 +33,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="MultiModel Video Processor API",
-    description="API for processing videos with AI-powered analysis, embeddings, and RAG - Phase 2",
-    version="2.0.0"
+    description="API for processing videos with AI-powered analysis, embeddings, and RAG - Phase 3-5 with Redis",
+    version="3.0.0"
 )
+
+# Initialize WebSocket service
+websocket_service = get_websocket_service()
+sio = websocket_service.get_app()
 
 # CORS middleware
 app.add_middleware(
@@ -46,11 +54,29 @@ app.add_middleware(
 video_processor = VideoProcessor()
 transcript_handler = TranscriptHandler()
 
+# Initialize Redis service
+redis_service = None
+redis_available = False
+
 # Create database tables on startup
 @app.on_event("startup")
 async def startup_event():
+    global redis_service, redis_available
+    
     create_tables()
     logger.info("Database tables created")
+    
+    # Initialize Redis
+    try:
+        redis_available = is_redis_available()
+        if redis_available:
+            redis_service = get_redis_service()
+            logger.info("Redis service initialized successfully")
+        else:
+            logger.warning("Redis not available - running without caching")
+    except Exception as e:
+        logger.error(f"Failed to initialize Redis: {e}")
+        redis_available = False
 
 # Pydantic models for API
 from pydantic import BaseModel
@@ -98,6 +124,22 @@ class EmbeddingRequest(BaseModel):
 class EmbeddingStatus(BaseModel):
     video_id: int
     status: str
+
+class TaskStatus(BaseModel):
+    task_id: str
+    status: str
+    progress: Optional[dict] = None
+    result: Optional[dict] = None
+    error: Optional[str] = None
+
+class ConversationStartRequest(BaseModel):
+    video_id: int
+
+class TaskResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+    video_id: Optional[int] = None
     chunks_processed: int
     total_chunks: int
     progress: float
@@ -123,7 +165,6 @@ class ChatSessionCreate(BaseModel):
     title: Optional[str] = None
 
 class ChatMessageRequest(BaseModel):
-    session_id: str
     message: str
 
 class VisualSearchRequest(BaseModel):
@@ -207,9 +248,8 @@ async def initialize_phase3_to_5():
             # Initialize RAG system
             openai_api_key = os.getenv("OPENAI_API_KEY")
             rag_system = await get_rag_system(openai_api_key)
-            
             # Initialize components
-            conversation_manager = ConversationManager(rag_system)
+            conversation_manager = ConversationManager(rag_system, websocket_service)
             visual_search_engine = VisualSearchEngine()
             content_segmentation_engine = ContentSegmentationEngine()
             
@@ -257,6 +297,35 @@ async def get_chat_session(session_id: str, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         logger.error(f"Error getting chat session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/chat/sessions/{session_id}/messages")
+async def send_chat_message(session_id: str, request: ChatMessageRequest, db: Session = Depends(get_db)):
+    """Send a message to a chat session"""
+    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
+        raise HTTPException(status_code=501, detail="Chat features not available")
+    
+    try:
+        session = conversation_manager.get_session(db, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Generate response using conversation manager
+        response_data = await conversation_manager.generate_enhanced_response(
+            db, session_id, request.message, session.video_id
+        )
+        
+        return {
+            "message_id": response_data.get('message_id'),
+            "response": response_data.get('response'),
+            "timestamp_citations": response_data.get('timestamp_citations', []),
+            "frame_references": response_data.get('frame_references', []),
+            "confidence": response_data.get('confidence', 0.0)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending chat message: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Visual Search Endpoints
@@ -314,7 +383,7 @@ async def generate_outline_endpoint(video_id: int, db: Session = Depends(get_db)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/content/navigation/{video_id}")
-async def get_navigation_data(video_id: int, db: Session = Depends(get_db)):
+async def get_navigation_data_api(video_id: int, db: Session = Depends(get_db)):
     """Get navigation data for video player"""
     if not PHASE3_TO_5_AVAILABLE or not content_segmentation_engine:
         raise HTTPException(status_code=501, detail="Content analysis features not available")
@@ -329,31 +398,84 @@ async def get_navigation_data(video_id: int, db: Session = Depends(get_db)):
 @app.get("/")
 async def root():
     return {
-        "message": "MultiModel Video Processor API - Phase 3-5", 
+        "message": "MultiModel Video Processor API - Phase 3-5 with Redis", 
         "status": "running",
+        "redis_available": redis_available,
         "features": {
             "phase_1": ["video_upload", "transcript_generation", "frame_extraction", "youtube_processing"],
             "phase_2": ["vector_embeddings", "semantic_search", "multimodal_rag", "video_summarization"] if PHASE2_AVAILABLE else ["not_available"],
             "phase_3": ["conversational_interface", "context_aware_chat", "timestamp_citations"] if PHASE3_TO_5_AVAILABLE else ["not_available"],
             "phase_4": ["visual_search", "object_detection", "scene_classification"] if PHASE3_TO_5_AVAILABLE else ["not_available"],
-            "phase_5": ["content_segmentation", "auto_outlines", "navigation_events"] if PHASE3_TO_5_AVAILABLE else ["not_available"]
+            "phase_5": ["content_segmentation", "auto_outlines", "navigation_events"] if PHASE3_TO_5_AVAILABLE else ["not_available"],
+            "caching": ["session_storage", "response_caching", "video_analysis_cache"] if redis_available else ["not_available"]
         },
         "version": "3.0.0"
     }
+
+@app.get("/health")
+async def health_check():
+    """Comprehensive health check including Redis"""
+    health_data = {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "services": {
+            "database": "healthy",
+            "redis": "not_available"
+        }
+    }
+    
+    # Check Redis health
+    if redis_available and redis_service:
+        try:
+            redis_health = redis_service.health_check()
+            health_data["services"]["redis"] = redis_health["status"]
+            health_data["redis_details"] = redis_health
+        except Exception as e:
+            health_data["services"]["redis"] = "unhealthy"
+            health_data["redis_error"] = str(e)
+    
+    return health_data
+
+@app.get("/redis/status")
+async def redis_status():
+    """Detailed Redis status and statistics"""
+    if not redis_available:
+        raise HTTPException(status_code=503, detail="Redis not available")
+    
+    try:
+        return redis_service.health_check()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis health check failed: {str(e)}")
+
+@app.post("/redis/cache/clear")
+async def clear_redis_cache():
+    """Clear all Redis cache (keep sessions)"""
+    if not redis_available:
+        raise HTTPException(status_code=503, detail="Redis not available")
+    
+    try:
+        success = redis_service.clear_all_cache()
+        if success:
+            return {"message": "Cache cleared successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to clear cache")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
 
 @app.get("/favicon.ico")
 async def favicon():
     """Return a simple favicon to prevent 404 errors"""
     return Response(status_code=204)  # No Content - browser will use default
 
-@app.post("/upload-video", response_model=VideoUploadResponse)
+@app.post("/upload-video", response_model=TaskResponse)
 async def upload_video(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db)
 ):
     """Upload and process a video file"""
-    try:        # Validate file format
+    try:
+        # Validate file format
         if not is_supported_format(file.filename):
             supported_formats = ['mp4', 'avi', 'mov', 'mkv', 'webm', 'flv', 'm4v']
             raise HTTPException(status_code=400, detail=f"Unsupported file format. Supported formats: {', '.join(supported_formats)}")
@@ -392,19 +514,54 @@ async def upload_video(
         db.commit()
         db.refresh(db_video)
         
-        # Schedule background processing
-        background_tasks.add_task(process_video_background, db_video.id, processed_path)
-        
-        # Clean up temp file
-        if os.path.exists(temp_full_path):
-            os.remove(temp_full_path)
-        
-        return VideoUploadResponse(
-            video_id=db_video.id,
-            filename=db_video.filename,
-            status="uploaded",
-            message="Video uploaded successfully. Processing started in background."
-        )
+        # Schedule Celery background processing
+        if redis_available:
+            task = celery_app.send_task('video.process', args=[db_video.id, processed_path])
+            
+            # Broadcast processing start status via WebSocket
+            try:
+                await websocket_service.broadcast_processing_status(
+                    db_video.id, 
+                    {
+                        "status": "started",
+                        "progress": 0,
+                        "message": f"Video processing started for {file.filename}",
+                        "task_id": task.id
+                    }
+                )
+            except Exception as ws_error:
+                logger.warning(f"Failed to broadcast WebSocket status: {ws_error}")
+            
+            # Clean up temp file
+            if os.path.exists(temp_full_path):
+                os.remove(temp_full_path)
+                
+            return TaskResponse(
+                task_id=task.id,
+                status="processing",
+                message=f"Video uploaded successfully. Processing started with task ID: {task.id}",
+                video_id=db_video.id,
+                chunks_processed=0,
+                total_chunks=0,
+                progress=0.0
+            )
+        else:
+            # Fallback to FastAPI BackgroundTasks if Redis not available
+            background_tasks.add_task(process_video_background, db_video.id, processed_path)
+            
+            # Clean up temp file
+            if os.path.exists(temp_full_path):
+                os.remove(temp_full_path)
+                
+            return TaskResponse(
+                task_id="fallback",
+                status="processing",
+                message="Video uploaded successfully. Processing started in background (fallback mode).",
+                video_id=db_video.id,
+                chunks_processed=0,
+                total_chunks=0,
+                progress=0.0
+            )
         
     except Exception as e:
         logger.error(f"Error uploading video: {str(e)}")
@@ -413,10 +570,10 @@ async def upload_video(
             os.remove(temp_full_path)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/process-youtube", response_model=VideoUploadResponse)
+@app.post("/process-youtube", response_model=TaskResponse)
 async def process_youtube_video(
-    background_tasks: BackgroundTasks,
     request: YouTubeProcessRequest,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db)
 ):
     """Process a YouTube video URL"""
@@ -429,10 +586,26 @@ async def process_youtube_video(
         if not video_id:
             raise HTTPException(status_code=400, detail="Could not extract video ID from URL")
         
-        # Create database record
+        # Check if video already exists
+        filename = f"youtube_{video_id}"
+        existing_video = db.query(Video).filter(Video.filename == filename).first()
+        
+        if existing_video:
+            # Video already exists, return existing video info
+            return TaskResponse(
+                task_id=f"existing_{existing_video.id}",
+                status="completed" if existing_video.processed else "processing",
+                message=f"Video already exists with ID: {existing_video.id}",
+                video_id=existing_video.id,
+                chunks_processed=1 if existing_video.transcript_generated else 0,
+                total_chunks=1,
+                progress=1.0 if existing_video.processed else 0.5
+            )
+        
+        # Create database record for new video
         db_video = Video(
-            filename=f"youtube_{video_id}",
-            original_filename=f"youtube_{video_id}",
+            filename=filename,
+            original_filename=filename,
             file_path="",  # YouTube videos don't have local file paths
             video_url=request.url,
             duration=0,  # Will be updated after processing
@@ -446,21 +619,54 @@ async def process_youtube_video(
         db.commit()
         db.refresh(db_video)
         
-        # Schedule background processing
-        background_tasks.add_task(
-            process_youtube_background, 
-            db_video.id, 
-            request.url, 
-            request.use_whisper, 
-            request.whisper_model
-        )
-        
-        return VideoUploadResponse(
-            video_id=db_video.id,
-            filename=db_video.filename,
-            status="processing",
-            message="YouTube video processing started in background."
-        )
+        # Schedule Celery background processing
+        if redis_available:
+            task = celery_app.send_task('youtube.process', args=[
+                db_video.id, request.url, request.use_whisper, request.whisper_model
+            ])
+            
+            # Broadcast processing start status via WebSocket
+            try:
+                await websocket_service.broadcast_processing_status(
+                    db_video.id, 
+                    {
+                        "status": "started",
+                        "progress": 0,
+                        "message": f"YouTube video processing started for {request.url}",
+                        "task_id": task.id
+                    }
+                )
+            except Exception as ws_error:
+                logger.warning(f"Failed to broadcast WebSocket status: {ws_error}")
+            
+            return TaskResponse(
+                task_id=task.id,
+                status="processing",
+                message=f"YouTube processing started with task ID: {task.id}",
+                video_id=db_video.id,
+                chunks_processed=0,
+                total_chunks=0,
+                progress=0.0
+            )
+        else:
+            # Fallback to FastAPI BackgroundTasks if Redis not available
+            background_tasks.add_task(
+                process_youtube_background, 
+                db_video.id,
+                request.url, 
+                request.use_whisper, 
+                request.whisper_model
+            )
+            
+            return TaskResponse(
+                task_id="fallback",
+                status="processing",
+                message="YouTube video processing started in background (fallback mode).",
+                video_id=db_video.id,
+                chunks_processed=0,
+                total_chunks=0,
+                progress=0.0
+            )
         
     except Exception as e:
         logger.error(f"Error processing YouTube video: {str(e)}")
@@ -538,8 +744,15 @@ async def get_video_status(video_id: int, db: Session = Depends(get_db)):
 
 @app.get("/video/{video_id}/transcript")
 async def get_video_transcript(video_id: int, db: Session = Depends(get_db)):
-    """Get transcript for a video"""
+    """Get transcript for a video with Redis caching"""
     try:
+        # Check Redis cache first
+        if redis_available and redis_service:
+            cached_transcript = redis_service.get_cached_video_analysis(video_id, "transcript")
+            if cached_transcript:
+                logger.info(f"Retrieved transcript for video {video_id} from Redis cache")
+                return cached_transcript
+        
         video = db.query(Video).filter(Video.id == video_id).first()
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
@@ -548,7 +761,7 @@ async def get_video_transcript(video_id: int, db: Session = Depends(get_db)):
             TranscriptChunk.video_id == video_id
         ).order_by(TranscriptChunk.start_time).all()
         
-        return {
+        transcript_data = {
             "video_id": video_id,
             "video_filename": video.filename,
             "transcript_chunks": [
@@ -563,14 +776,28 @@ async def get_video_transcript(video_id: int, db: Session = Depends(get_db)):
             ]
         }
         
+        # Cache in Redis for 24 hours
+        if redis_available and redis_service and transcript_chunks:
+            redis_service.cache_video_analysis(video_id, "transcript", transcript_data, expire_hours=24)
+            logger.info(f"Cached transcript for video {video_id} in Redis")
+        
+        return transcript_data
+        
     except Exception as e:
         logger.error(f"Error getting transcript: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/video/{video_id}/frames")
 async def get_video_frames(video_id: int, db: Session = Depends(get_db)):
-    """Get extracted frames for a video"""
+    """Get extracted frames for a video with Redis caching"""
     try:
+        # Check Redis cache first
+        if redis_available and redis_service:
+            cached_frames = redis_service.get_cached_video_analysis(video_id, "frames")
+            if cached_frames:
+                logger.info(f"Retrieved frames for video {video_id} from Redis cache")
+                return cached_frames
+        
         video = db.query(Video).filter(Video.id == video_id).first()
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
@@ -579,7 +806,7 @@ async def get_video_frames(video_id: int, db: Session = Depends(get_db)):
             VideoFrame.video_id == video_id
         ).order_by(VideoFrame.timestamp).all()
         
-        return {
+        frames_data = {
             "video_id": video_id,
             "video_filename": video.filename,
             "frames": [
@@ -594,6 +821,13 @@ async def get_video_frames(video_id: int, db: Session = Depends(get_db)):
                 for frame in frames
             ]
         }
+        
+        # Cache in Redis for 24 hours
+        if redis_available and redis_service and frames:
+            redis_service.cache_video_analysis(video_id, "frames", frames_data, expire_hours=24)
+            logger.info(f"Cached frames for video {video_id} in Redis")
+        
+        return frames_data
         
     except Exception as e:
         logger.error(f"Error getting frames: {str(e)}")
@@ -627,10 +861,10 @@ async def list_videos(db: Session = Depends(get_db)):
 # PHASE 2: VECTOR EMBEDDINGS & RAG API ENDPOINTS
 # ===============================
 
-@app.post("/api/v1/embeddings/generate", response_model=List[EmbeddingStatus])
+@app.post("/api/v1/embeddings/generate", response_model=TaskResponse)
 async def generate_embeddings(
     request: EmbeddingRequest,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db)
 ):
     """Generate embeddings for video content"""
@@ -638,262 +872,40 @@ async def generate_embeddings(
         raise HTTPException(status_code=501, detail="Phase 2 features not available. Install embedding requirements.")
     
     try:
-        # Validate video IDs
-        valid_videos = []
-        for video_id in request.video_ids:
-            video = db.query(Video).filter(Video.id == video_id).first()
-            if video:
-                valid_videos.append(video_id)
-            else:
-                logger.warning(f"Video {video_id} not found")
+        # Validate video ID
+        video = db.query(Video).filter(Video.id == request.video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail=f"Video {request.video_id} not found")
         
-        if not valid_videos:
-            raise HTTPException(status_code=400, detail="No valid video IDs provided")
-        
-        # Start background embedding generation
-        for video_id in valid_videos:
-            background_tasks.add_task(generate_embeddings_background, video_id)
-        
-        # Return initial status
-        results = []
-        for video_id in valid_videos:
-            results.append(EmbeddingStatus(
-                video_id=video_id,
-                text_embeddings_count=0,
-                frame_embeddings_count=0,
-                status="processing"
-            ))
-        
-        return results
+        # Start Celery background embedding generation
+        if redis_available:
+            task = celery_app.send_task('embeddings.generate', args=[request.video_id])
+            
+            return TaskResponse(
+                task_id=task.id,
+                status="processing",
+                message=f"Embedding generation started with task ID: {task.id}",
+                video_id=request.video_id,
+                chunks_processed=0,
+                total_chunks=0,
+                progress=0.0
+            )
+        else:
+            # Fallback to FastAPI BackgroundTasks if Redis not available
+            background_tasks.add_task(generate_embeddings_background, request.video_id)
+            
+            return TaskResponse(
+                task_id="fallback",
+                status="processing",
+                message="Embedding generation started in background (fallback mode).",
+                video_id=request.video_id,
+                chunks_processed=0,
+                total_chunks=0,
+                progress=0.0
+            )
         
     except Exception as e:
         logger.error(f"Error generating embeddings: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/embeddings/status/{video_id}", response_model=EmbeddingStatus)
-async def get_embedding_status(video_id: int, db: Session = Depends(get_db)):
-    """Get embedding generation status for a video"""
-    if not PHASE2_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 2 features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        # Count existing embeddings (this is a simplified check)
-        transcript_count = db.query(TranscriptChunk).filter(TranscriptChunk.video_id == video_id).count()
-        frame_count = db.query(VideoFrame).filter(VideoFrame.video_id == video_id).count()
-        
-        return EmbeddingStatus(
-            video_id=video_id,
-            text_embeddings_count=transcript_count,
-            frame_embeddings_count=frame_count,
-            status="completed" if transcript_count > 0 or frame_count > 0 else "pending"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting embedding status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/search/semantic", response_model=SearchResult)
-async def semantic_search(request: SearchRequest):
-    """Perform semantic search across video content"""
-    if not PHASE2_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 2 features not available")
-    
-    try:
-        embedding_engine = await get_embedding_engine()
-        
-        # Generate query embedding
-        query_embedding = await embedding_engine.generate_text_embeddings([request.query])
-        
-        # Search for similar content
-        results = await embedding_engine.search_similar_content(
-            query_embedding[0],
-            content_type=request.search_type,
-            limit=request.max_results,
-            video_id=request.video_ids[0] if request.video_ids and len(request.video_ids) == 1 else None
-        )
-        
-        return SearchResult(
-            query=request.query,
-            results=results,
-            total_results=len(results)
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in semantic search: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/query/multimodal", response_model=RAGResponse)
-async def multimodal_query(request: RAGRequest):
-    """Ask questions about video content using RAG"""
-    if not PHASE2_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 2 features not available")
-    
-    try:
-        # Get OpenAI API key from environment
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        
-        rag_system = await get_rag_system(openai_api_key)
-        
-        # Process the query
-        result = await rag_system.process_query(
-            query=request.query,
-            video_ids=request.video_ids,
-            search_type=request.search_type,
-            max_results=request.max_results
-        )
-        
-        return RAGResponse(
-            query=result["query"],
-            response=result["response"],
-            context=result["context"],
-            video_ids=result["video_ids"]
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in multimodal query: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/video/{video_id}/summary", response_model=VideoSummaryResponse)
-async def get_video_summary(video_id: int, db: Session = Depends(get_db)):
-    """Generate a comprehensive summary of a video"""
-    if not PHASE2_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 2 features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        # Get OpenAI API key from environment
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        
-        rag_system = await get_rag_system(openai_api_key)
-        
-        # Generate summary
-        summary_result = await rag_system.summarize_video(video_id)
-        
-        return VideoSummaryResponse(**summary_result)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error generating video summary: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/similarity/find/{video_id}")
-async def find_similar_videos(video_id: int, limit: int = 5, db: Session = Depends(get_db)):
-    """Find videos similar to the given video"""
-    if not PHASE2_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 2 features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        # This is a placeholder for video-to-video similarity
-        # In full implementation, you would:
-        # 1. Get the average embedding for the video
-        # 2. Search for similar videos using that embedding
-        # 3. Return ranked results
-        
-        return {
-            "video_id": video_id,
-            "similar_videos": [],
-            "message": "Video similarity feature coming soon"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error finding similar videos: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ===============================
-# PHASE 3-5: ADVANCED FEATURES API ENDPOINTS
-# ===============================
-
-@app.post("/api/v1/conversation/start", response_model=dict)
-async def start_conversation(video_id: int, db: Session = Depends(get_db)):
-    """Start a new conversation session for a video"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
-    
-    try:
-        # Initialize conversation manager
-        if conversation_manager is None:
-            raise HTTPException(status_code=500, detail="Conversation manager not available")
-        
-        # Start a new session
-        session_id = conversation_manager.start_session(video_id)
-        
-        return {"session_id": session_id, "status": "started"}
-        
-    except Exception as e:
-        logger.error(f"Error starting conversation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/conversation/{session_id}/ask", response_model=dict)
-async def ask_question(session_id: str, request: dict):
-    """Ask a question in the conversation"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
-    
-    try:
-        if conversation_manager is None:
-            raise HTTPException(status_code=500, detail="Conversation manager not available")
-        
-        # Process the question
-        response = conversation_manager.process_question(session_id, request["question"])
-        
-        return {"response": response}
-        
-    except Exception as e:
-        logger.error(f"Error in conversation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/visual-search", response_model=dict)
-async def visual_search(request: dict):
-    """Perform visual search for a video"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
-    
-    try:
-        if visual_search_engine is None:
-            raise HTTPException(status_code=500, detail="Visual search engine not available")
-        
-        # Perform the visual search
-        results = visual_search_engine.search(request["image_path"], request.get("top_k", 5))
-        
-        return {"results": results}
-        
-    except Exception as e:
-        logger.error(f"Error in visual search: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/content-navigation", response_model=dict)
-async def content_navigation(request: dict):
-    """Navigate and segment video content"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 3-5 features not available")
-    
-    try:
-        if content_segmentation_engine is None:
-            raise HTTPException(status_code=500, detail="Content segmentation engine not available")
-        
-        # Segment the content
-        segments = content_segmentation_engine.segment(request["video_id"], request.get("threshold", 0.5))
-        
-        return {"segments": segments}
-        
-    except Exception as e:
-        logger.error(f"Error in content navigation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Background processing functions
@@ -1013,302 +1025,79 @@ async def generate_embeddings_background(video_id: int):
         logger.error(f"Error in background embedding generation for video {video_id}: {e}")
 
 # ===============================
-# PHASE 3: CONVERSATIONAL INTERFACE API ENDPOINTS
+# TASK STATUS MANAGEMENT
 # ===============================
 
-@app.post("/api/v1/chat/session", response_model=ChatSessionResponse)
-async def create_chat_session(request: ChatSessionCreate, db: Session = Depends(get_db)):
-    """Create a new chat session for a video"""
-    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
-        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
+@app.get("/task/{task_id}", response_model=TaskStatus)
+async def get_task_status(task_id: str):
+    """Get the status of a background task"""
+    if not redis_available:
+        raise HTTPException(status_code=503, detail="Redis not available - cannot check task status")
     
     try:
-        video = db.query(Video).filter(Video.id == request.video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
+        # Get task result from Celery
+        result = celery_app.AsyncResult(task_id)
         
-        session = conversation_manager.create_session(db, request.video_id, request.title)
+        if result.state == 'PENDING':
+            response = {
+                "task_id": task_id,
+                "status": "pending",
+                "progress": None,
+                "result": None,
+                "error": None
+            }
+        elif result.state == 'PROGRESS':
+            response = {
+                "task_id": task_id,
+                "status": "processing",
+                "progress": result.info,
+                "result": None,
+                "error": None
+            }
+        elif result.state == 'SUCCESS':
+            response = {
+                "task_id": task_id,
+                "status": "completed",
+                "progress": None,
+                "result": result.result,
+                "error": None
+            }
+        else:  # FAILURE
+            response = {
+                "task_id": task_id,
+                "status": "failed",
+                "progress": None,
+                "result": None,
+                "error": str(result.info)
+            }
         
-        return ChatSessionResponse(
-            session_id=session.session_id,
-            video_id=session.video_id,
-            title=session.title,
-            created_at=session.created_at.isoformat()
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating chat session: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/chat/message", response_model=ChatMessageResponse)
-async def send_chat_message(request: ChatMessageRequest, db: Session = Depends(get_db)):
-    """Send a message in a chat session and get AI response"""
-    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
-        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
-    
-    try:
-        session = conversation_manager.get_session(db, request.session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Chat session not found")
-        
-        response = await conversation_manager.generate_enhanced_response(
-            db, request.session_id, request.message, session.video_id
-        )
-        
-        return ChatMessageResponse(**response)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error processing chat message: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/chat/session/{session_id}/history")
-async def get_chat_history(session_id: str, db: Session = Depends(get_db)):
-    """Get complete chat session history"""
-    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
-        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
-    
-    try:
-        history = conversation_manager.get_session_history(db, session_id)
-        if not history:
-            raise HTTPException(status_code=404, detail="Chat session not found")
-        
-        return history
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting chat history: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/v1/chat/session/{session_id}")
-async def close_chat_session(session_id: str, db: Session = Depends(get_db)):
-    """Close a chat session"""
-    if not PHASE3_TO_5_AVAILABLE or not conversation_manager:
-        raise HTTPException(status_code=501, detail="Phase 3 conversational features not available")
-    
-    try:
-        conversation_manager.close_session(db, session_id)
-        return {"message": "Chat session closed successfully"}
+        return TaskStatus(**response)
         
     except Exception as e:
-        logger.error(f"Error closing chat session: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error checking task status: {e}")
+        raise HTTPException(status_code=500, detail=f"Error checking task status: {str(e)}")
 
-# ===============================
-# PHASE 4: VISUAL SEARCH ENGINE API ENDPOINTS
-# ===============================
+# WebSocket status endpoints for debugging
+@app.get("/api/v1/websocket/status")
+async def websocket_status():
+    """Get WebSocket service status"""
+    return {
+        "connected_clients": websocket_service.get_connected_clients_count(),
+        "socket_io_initialized": sio is not None,
+        "service_status": "running"
+    }
 
-@app.post("/api/v1/visual/process/{video_id}")
-async def process_video_visual_content(
-    video_id: int, 
-    background_tasks: BackgroundTasks,
-    confidence_threshold: float = 0.5,
-    db: Session = Depends(get_db)
-):
-    """Process video frames for object detection and scene classification"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        # Start background processing
-        background_tasks.add_task(
-            process_visual_content_background, video_id, confidence_threshold
-        )
-        
-        return {
-            "video_id": video_id,
-            "status": "processing",
-            "message": "Visual content processing started in background"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error starting visual content processing: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/api/v1/websocket/connections")
+async def websocket_connections():
+    """Get active WebSocket connections"""
+    return {
+        "active_connections": websocket_service.get_connected_clients_count(),
+        "session_rooms": len(websocket_service.session_rooms),        "service_initialized": True    }
 
-@app.post("/api/v1/visual/search", response_model=VisualSearchResponse)
-async def visual_search(request: VisualSearchRequest, db: Session = Depends(get_db)):
-    """Search for visual content using natural language queries"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == request.video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        search_results = visual_search_engine.search_visual_content(
-            db, request.video_id, request.query, request.confidence_threshold
-        )
-        
-        # Format response to match VisualSearchResponse model
-        formatted_response = {
-            "video_id": str(request.video_id),
-            "results": search_results.get("results", []),
-            "total_matches": search_results.get("total_results", 0)
-        }
-        
-        return VisualSearchResponse(**formatted_response)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in visual search: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/visual/{video_id}/timeline")
-async def get_visual_timeline(video_id: int, db: Session = Depends(get_db)):
-    """Get visual timeline showing detected objects and scenes"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        timeline = visual_search_engine.get_visual_timeline(db, video_id)
-        return timeline
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting visual timeline: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/visual/{video_id}/statistics")
-async def get_object_statistics(video_id: int, db: Session = Depends(get_db)):
-    """Get statistics about detected objects in the video"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 4 visual search features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        stats = visual_search_engine.get_object_statistics(db, video_id)
-        return stats
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting object statistics: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ===============================
-# PHASE 5: NAVIGATION & USER INTERFACE API ENDPOINTS
-# ===============================
-
-@app.post("/api/v1/content/analyze/{video_id}", response_model=TopicSegmentResponse)
-async def analyze_video_content(video_id: int, db: Session = Depends(get_db)):
-    """Analyze video content to create topic segments"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 5 content analysis features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        result = content_segmentation_engine.create_topic_segments(db, video_id)
-        
-        return TopicSegmentResponse(**result)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error analyzing video content: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/content/outline/{video_id}", response_model=ContentOutlineResponse)
-async def generate_content_outline(video_id: int, db: Session = Depends(get_db)):
-    """Generate hierarchical content outline for the video"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 5 content analysis features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        result = content_segmentation_engine.generate_content_outline(db, video_id)
-        
-        return ContentOutlineResponse(**result)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error generating content outline: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/navigation/events/{video_id}")
-async def create_navigation_events(video_id: int, db: Session = Depends(get_db)):
-    """Create navigation events for enhanced video navigation"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 5 navigation features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        result = content_segmentation_engine.create_navigation_events(db, video_id)
-        
-        return result
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating navigation events: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/navigation/{video_id}")
-async def get_navigation_data(video_id: int, db: Session = Depends(get_db)):
-    """Get comprehensive navigation data for a video"""
-    if not PHASE3_TO_5_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Phase 5 navigation features not available")
-    
-    try:
-        video = db.query(Video).filter(Video.id == video_id).first()
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        navigation_data = content_segmentation_engine.get_video_navigation_data(db, video_id)
-        
-        return navigation_data
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting navigation data: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Background processing functions for Phase 4
-async def process_visual_content_background(video_id: int, confidence_threshold: float):
-    """Background task to process visual content of a video"""
-    db = next(get_db())
-    try:
-        logger.info(f"Starting visual content processing for video {video_id}")
-        
-        result = visual_search_engine.process_video_frames(db, video_id, confidence_threshold)
-        
-        logger.info(f"Completed visual content processing for video {video_id}: {result}")
-        
-    except Exception as e:
-        logger.error(f"Error in visual content processing for video {video_id}: {e}")
-    finally:
-        db.close()
+# Create Socket.IO ASGI app that wraps the FastAPI app (must be after all routes)
+import socketio
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="socket.io")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(socket_app, host="0.0.0.0", port=8000)  # Run socket_app instead of app

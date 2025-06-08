@@ -3,9 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MultiModelVideo - Phase 3-5 Features</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>MultiModelVideo - Phase 3-5 Features</title>    <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
     <style>
         .chat-message {
             animation: slideIn 0.3s ease-out;
@@ -60,10 +60,13 @@
 </head>
 <body class="bg-gray-100 min-h-screen">
     <!-- Header -->
-    <header class="bg-blue-600 text-white p-4 shadow-lg">
-        <div class="container mx-auto flex justify-between items-center">
+    <header class="bg-blue-600 text-white p-4 shadow-lg">        <div class="container mx-auto flex justify-between items-center">
             <h1 class="text-2xl font-bold">MultiModelVideo - Phase 3-5 Demo</h1>
-            <div class="flex space-x-4">
+            <div class="flex items-center space-x-4">
+                <div class="flex items-center space-x-2">
+                    <div id="connection-status" class="h-3 w-3 bg-red-500 rounded-full" title="Disconnected"></div>
+                    <span class="text-sm">WebSocket</span>
+                </div>
                 <button onclick="switchTab('chat')" id="chat-tab" class="px-4 py-2 rounded bg-blue-500 hover:bg-blue-700">Chat</button>
                 <button onclick="switchTab('visual')" id="visual-tab" class="px-4 py-2 rounded bg-blue-500 hover:bg-blue-700">Visual Search</button>
                 <button onclick="switchTab('content')" id="content-tab" class="px-4 py-2 rounded bg-blue-500 hover:bg-blue-700">Content Analysis</button>
@@ -293,16 +296,182 @@
         </div>
     </div>
 
-    <script>
-        // Application State
+    <script>        // Application State
         let currentVideo = null;
         let chatSession = null;
         let currentTab = 'chat';        // API Configuration
         const API_BASE = 'http://localhost:8000';
 
-        // Initialize the application
+        // WebSocket Configuration
+        let socket = null;
+        let isConnected = false;
+
+        // Initialize WebSocket connection
+        function initializeWebSocket() {
+            try {
+                socket = io(API_BASE, {
+                    transports: ['websocket', 'polling'],
+                    timeout: 20000,
+                    reconnection: true,
+                    reconnectionAttempts: 5,
+                    reconnectionDelay: 1000
+                });
+
+                socket.on('connect', () => {
+                    console.log('WebSocket connected');
+                    isConnected = true;
+                    updateConnectionStatus(true);
+                });
+
+                socket.on('disconnect', () => {
+                    console.log('WebSocket disconnected');
+                    isConnected = false;
+                    updateConnectionStatus(false);
+                });
+
+                socket.on('chat_message', (data) => {
+                    handleChatMessage(data);
+                });
+
+                socket.on('processing_status', (data) => {
+                    handleProcessingStatus(data);
+                });
+
+                socket.on('visual_analysis', (data) => {
+                    handleVisualAnalysis(data);
+                });
+
+                socket.on('connect_error', (error) => {
+                    console.error('WebSocket connection error:', error);
+                    updateConnectionStatus(false);
+                });
+
+            } catch (error) {
+                console.error('Failed to initialize WebSocket:', error);
+            }
+        }
+
+        // Update connection status indicator
+        function updateConnectionStatus(connected) {
+            const statusElement = document.getElementById('connection-status');
+            if (statusElement) {
+                statusElement.className = connected ? 
+                    'h-3 w-3 bg-green-500 rounded-full' : 
+                    'h-3 w-3 bg-red-500 rounded-full';
+                statusElement.title = connected ? 'Connected' : 'Disconnected';
+            }
+        }
+
+        // Handle real-time chat messages
+        function handleChatMessage(data) {
+            if (data.session_id === chatSession?.session_id) {
+                displayChatMessage(data.message, data.sender || 'assistant');
+            }
+        }
+
+        // Handle processing status updates
+        function handleProcessingStatus(data) {
+            console.log('Processing status:', data);
+            showNotification(`Processing: ${data.message}`, data.status === 'error' ? 'error' : 'info');
+            
+            // Update progress bar if exists
+            const progressBar = document.getElementById('processing-progress');
+            if (progressBar) {
+                progressBar.style.width = `${data.progress || 0}%`;
+            }
+        }        // Handle visual analysis results
+        function handleVisualAnalysis(data) {
+            console.log('Visual analysis results:', data);
+            if (currentTab === 'visual' && currentVideo?.id === data.video_id) {
+                // Update visual search results in real-time
+                displayVisualSearchResults(data.results);
+                showNotification('Visual analysis complete!', 'success');
+            }
+        }
+
+        // Show notification
+        function showNotification(message, type = 'info') {
+            // Create notification element
+            const notification = document.createElement('div');
+            notification.className = `fixed top-4 right-4 z-50 p-4 rounded-lg shadow-lg max-w-sm transform transition-transform duration-300 translate-x-full`;
+            
+            // Set color based on type
+            const colors = {
+                'success': 'bg-green-500 text-white',
+                'error': 'bg-red-500 text-white',
+                'info': 'bg-blue-500 text-white',
+                'warning': 'bg-yellow-500 text-black'
+            };
+            
+            notification.className += ` ${colors[type] || colors.info}`;
+            notification.textContent = message;
+            
+            // Add to page
+            document.body.appendChild(notification);
+            
+            // Animate in
+            setTimeout(() => {
+                notification.classList.remove('translate-x-full');
+            }, 100);
+            
+            // Remove after 5 seconds
+            setTimeout(() => {
+                notification.classList.add('translate-x-full');
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.parentNode.removeChild(notification);
+                    }
+                }, 300);            }, 5000);
+        }
+
+        // Create chat session and join WebSocket room
+        async function createChatSession(videoId) {
+            try {                // Create session via API
+                const response = await fetch(`${API_BASE}/api/v1/chat/sessions?video_id=${videoId}&title=${encodeURIComponent('Frontend Demo Session')}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to create chat session');
+                }
+                
+                const data = await response.json();
+                chatSession = data.session_id;
+                
+                // Join WebSocket room for this session
+                if (socket && isConnected) {
+                    socket.emit('join_chat_session', { session_id: chatSession });
+                }
+                
+                // Clear chat messages
+                const messagesContainer = document.getElementById('chat-messages');
+                messagesContainer.innerHTML = '<div class="text-center text-gray-500 mt-8">Chat session created! Start asking questions about the video.</div>';
+                
+                console.log('Chat session created:', chatSession);
+                return chatSession;
+                
+            } catch (error) {
+                console.error('Error creating chat session:', error);
+                showNotification('Failed to create chat session', 'error');
+                throw error;
+            }
+        }
+
+        // Join processing status updates for a task
+        function subscribeToProcessingUpdates(taskId) {
+            if (socket && isConnected) {
+                socket.emit('subscribe_processing', { task_id: taskId });
+            }
+        }
+
+        // Display chat message (updated for WebSocket support)
+        function displayChatMessage(message, sender) {
+            addChatMessage(sender, message);
+        }// Initialize the application
         document.addEventListener('DOMContentLoaded', function() {
             switchTab('chat');
+            initializeWebSocket();
         });
 
         // Tab switching
@@ -531,10 +700,29 @@
             }
 
             const resultsContainer = document.getElementById('visual-results');
-            resultsContainer.innerHTML = '<div class="text-center text-gray-500 py-2">Searching...</div>';
+            resultsContainer.innerHTML = '<div class="text-center text-gray-500 py-2">Searching...</div>';            try {
+                // Call actual visual search API
+                const response = await fetch(`${API_BASE}/api/v1/visual/search`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        video_id: currentVideo.id,
+                        query: query,
+                        confidence_threshold: 0.5
+                    })
+                });
 
-            try {
-                // Demo visual search results
+                if (!response.ok) {
+                    throw new Error('Visual search failed');
+                }
+
+                const data = await response.json();
+                displayVisualSearchResults(data.results);
+
+            } catch (error) {
+                console.error('Error in visual search:', error);
+                
+                // Fallback to demo results
                 const demoResults = [
                     {
                         timestamp: 30,
@@ -550,20 +738,28 @@
                     }
                 ];
 
-                resultsContainer.innerHTML = demoResults.map(result => `
-                    <div class="visual-search-result bg-gray-50 p-3 rounded cursor-pointer hover:bg-gray-100" 
-                         onclick="jumpToTimestamp(${result.timestamp})">
-                        <div class="font-medium text-sm">${formatTimestamp(result.timestamp)}</div>
-                        <div class="text-xs text-gray-600">${result.description}</div>
-                        <div class="text-xs text-blue-600">Relevance: ${Math.round(result.relevance_score * 100)}%</div>
-                    </div>
-                `).join('');
-
-            } catch (error) {
-                console.error('Visual search error:', error);
-                resultsContainer.innerHTML = '<div class="text-red-500 text-sm">Search failed. Try again.</div>';
+                displayVisualSearchResults(demoResults);                showNotification('Using demo visual search results', 'warning');
             }
-        }        // Video Tab Switching
+        }
+
+        // Display visual search results
+        function displayVisualSearchResults(results) {
+            const resultsContainer = document.getElementById('visual-results');
+            
+            if (!results || results.length === 0) {
+                resultsContainer.innerHTML = '<div class="text-center text-gray-500 py-2">No results found</div>';
+                return;
+            }
+
+            resultsContainer.innerHTML = results.map(result => `
+                <div class="visual-search-result bg-gray-50 p-3 rounded cursor-pointer hover:bg-gray-100" 
+                     onclick="jumpToTimestamp(${result.timestamp})">
+                    <div class="font-medium text-sm">${formatTimestamp(result.timestamp)}</div>
+                    <div class="text-xs text-gray-600">${result.description}</div>
+                    <div class="text-xs text-blue-600">Relevance: ${Math.round(result.relevance_score * 100)}%</div>
+                </div>
+            `).join('');
+        }// Video Tab Switching
         function switchVideoTab(tab) {
             // Update tab buttons
             document.querySelectorAll('[id$="-tab"]').forEach(btn => {
@@ -668,9 +864,13 @@
                         use_whisper: false,
                         whisper_model: 'base'
                     })
-                });
-
-                const data = await response.json();
+                });                const data = await response.json();
+                
+                // Subscribe to processing updates via WebSocket
+                if (data.task_id) {
+                    subscribeToProcessingUpdates(data.task_id);
+                    showNotification(`Processing started - Task ID: ${data.task_id}`, 'info');
+                }
                 
                 // Update video info
                 showVideoInfo(title, duration, 'Ready for analysis');

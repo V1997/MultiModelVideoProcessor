@@ -6,18 +6,38 @@ from typing import List, Dict, Optional, Tuple, Any
 from sqlalchemy.orm import Session
 from backend.database.models import ChatSession, ChatMessage, ConversationContext, Video, TranscriptChunk, VideoFrame
 from backend.embedding_engine.rag import MultimodalRAG
+from backend.services.redis_service import get_redis_service, is_redis_available
 import json
 import re
+import logging
+import asyncio
+
+logger = logging.getLogger(__name__)
 
 class ConversationManager:
     """
     Manages context-aware conversations with video content.
     Maintains conversation history, references timestamps, and provides enriched responses.
+    Integrates with Redis for fast session storage and message caching.
+    Supports real-time WebSocket broadcasting for live chat updates.
     """
     
-    def __init__(self, rag_system: MultimodalRAG):
+    def __init__(self, rag_system: MultimodalRAG, websocket_service=None):
         self.rag_system = rag_system
         self.max_context_messages = 10  # Keep last 10 messages for context
+        self.redis_available = is_redis_available()
+        self.redis_service = get_redis_service() if self.redis_available else None
+        self.websocket_service = websocket_service  # WebSocket service for real-time updates
+        
+        if self.redis_available:
+            logger.info("ConversationManager initialized with Redis support")
+        else:
+            logger.warning("ConversationManager initialized without Redis (fallback to database only)")
+            
+        if self.websocket_service:
+            logger.info("ConversationManager initialized with WebSocket support")
+        else:
+            logger.warning("ConversationManager initialized without WebSocket support")
         
     def create_session(self, db: Session, video_id: int, title: str = None) -> ChatSession:
         """Create a new chat session for a video."""
@@ -33,7 +53,7 @@ class ConversationManager:
         db.commit()
         db.refresh(chat_session)
         
-        # Initialize conversation context
+        # Initialize conversation context in database
         context = ConversationContext(
             session_id=chat_session.id,
             key_topics=[],
@@ -42,19 +62,67 @@ class ConversationManager:
         db.add(context)
         db.commit()
         
+        # Store session in Redis for fast access
+        if self.redis_service:
+            session_data = {
+                'session_id': session_id,
+                'video_id': video_id,
+                'title': chat_session.title,
+                'created_at': chat_session.created_at.isoformat(),
+                'is_active': True,
+                'message_count': 0        }
+            self.redis_service.session_create(session_id, session_data, expire_hours=48)
+            logger.info(f"Session {session_id} cached in Redis")
+        
         return chat_session
     
     def get_session(self, db: Session, session_id: str) -> Optional[ChatSession]:
-        """Retrieve a chat session by session ID."""
-        return db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
+        """Retrieve a chat session by session ID with Redis caching."""
+        # Try Redis cache first
+        if self.redis_service:
+            cached_session = self.redis_service.session_get(session_id)
+            if cached_session:
+                logger.debug(f"Session {session_id} retrieved from Redis cache")
+                # Still return database object for full functionality
+                session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
+                if session:
+                    return session
+                # If not in DB but in Redis, remove from Redis
+                self.redis_service.session_delete(session_id)
+        
+        # Fallback to database
+        session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
+        
+        # Cache in Redis if found and Redis is available
+        if session and self.redis_service:
+            session_data = {
+                'session_id': session.session_id,
+                'video_id': session.video_id,
+                'title': session.title,
+                'created_at': session.created_at.isoformat(),
+                'updated_at': session.updated_at.isoformat(),
+                'is_active': session.is_active
+            }
+            self.redis_service.session_create(session_id, session_data, expire_hours=48)
+            logger.debug(f"Session {session_id} cached in Redis from database")
+        
+        return session
     
     def get_conversation_context(self, db: Session, session_id: int) -> List[Dict]:
-        """Get recent conversation history for context."""
+        """Get recent conversation history for context with Redis caching."""
+        # Try to get from Redis cache first
+        if self.redis_service:
+            cached_messages = self.redis_service.chat_get_cached_messages(str(session_id))
+            if cached_messages:
+                logger.debug(f"Retrieved {len(cached_messages)} cached messages from Redis")
+                return cached_messages[-self.max_context_messages:]
+        
+        # Fallback to database
         messages = db.query(ChatMessage).filter(
             ChatMessage.session_id == session_id
         ).order_by(ChatMessage.created_at.desc()).limit(self.max_context_messages).all()
         
-        return [
+        context_messages = [
             {
                 "role": msg.role,
                 "content": msg.content,
@@ -64,6 +132,13 @@ class ConversationManager:
             }
             for msg in reversed(messages)
         ]
+        
+        # Cache the messages in Redis
+        if self.redis_service and context_messages:
+            self.redis_service.chat_cache_messages(str(session_id), context_messages)
+            logger.debug(f"Cached {len(context_messages)} messages in Redis")
+        
+        return context_messages
 
     def extract_timestamp_references(self, text: str) -> List[float]:
         """Extract timestamp references from text (e.g., "at 2:30", "around 1:45")."""
@@ -105,8 +180,7 @@ class ConversationManager:
         
         # Add frame results
         for result in rag_results.get('frame_results', []):
-            frame_info = {
-                'frame_path': result['frame_path'],
+            frame_info = {                'frame_path': result['frame_path'],
                 'timestamp': result['timestamp'],
                 'confidence': result.get('confidence', 0.0),
                 'source': 'frame'
@@ -114,13 +188,53 @@ class ConversationManager:
             relevant_segments.append(frame_info)
         
         return relevant_segments
-
+    
     async def generate_enhanced_response(self, db: Session, session_id: str, user_query: str, 
                                          video_id: int) -> Dict[str, Any]:
-        """Generate a context-aware response with multimedia enhancements."""
+        """Generate a context-aware response with multimedia enhancements and Redis caching."""
         session = self.get_session(db, session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
+        
+        # Check for cached response first (for identical queries)
+        query_cache_key = f"response:{video_id}:{hash(user_query)}"
+        if self.redis_service:
+            cached_response = self.redis_service.cache_get(query_cache_key)
+            if cached_response:
+                logger.info(f"Retrieved cached response for query: {user_query[:50]}...")
+                # Still save to database for history
+                user_message = ChatMessage(
+                    session_id=session.id,
+                    role="user",
+                    content=user_query,
+                    created_at=datetime.utcnow()
+                )
+                db.add(user_message)
+                
+                assistant_message = ChatMessage(
+                    session_id=session.id,
+                    role="assistant",
+                    content=cached_response['response'],
+                    timestamp_references=cached_response.get('timestamp_citations', []),
+                    frame_references=cached_response.get('frame_references', []),
+                    confidence_score=cached_response.get('confidence', 0.0),
+                    created_at=datetime.utcnow()
+                )
+                db.add(assistant_message)
+                db.commit()
+                
+                # Update Redis cache with new messages
+                if self.redis_service:
+                    new_message = {
+                        "role": "assistant",
+                        "content": cached_response['response'],
+                        "timestamp_references": cached_response.get('timestamp_citations', []),
+                        "frame_references": cached_response.get('frame_references', []),
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    self.redis_service.chat_add_message(session_id, new_message)
+                
+                return cached_response
         
         # Get conversation context
         context_messages = self.get_conversation_context(db, session.id)
@@ -184,18 +298,62 @@ class ConversationManager:
             created_at=datetime.utcnow()
         )
         db.add(assistant_message)
-          # Update conversation context
+        
+        # Update conversation context
         self.update_conversation_context(db, session.id, user_query, response_content, 
                                        cited_timestamps, frame_references)
         
         db.commit()
-        
-        return {
+          # Prepare response
+        response_data = {
             'message_id': str(assistant_message.id),
             'response': response_content,
             'confidence': overall_confidence,
-            'timestamp_citations': cited_timestamps
+            'timestamp_citations': cited_timestamps,
+            'frame_references': frame_references
         }
+        
+        # Cache the response in Redis
+        if self.redis_service:
+            self.redis_service.cache_set(query_cache_key, response_data, expire_seconds=3600)  # 1 hour cache
+            logger.debug(f"Cached response for query: {user_query[:50]}...")
+            
+            # Add message to chat cache
+            user_msg = {
+                "role": "user",
+                "content": user_query,
+                "timestamp_references": timestamp_refs,
+                "created_at": user_message.created_at.isoformat()
+            }
+            assistant_msg = {
+                "role": "assistant",
+                "content": response_content,
+                "timestamp_references": cited_timestamps,
+                "frame_references": frame_references,
+                "created_at": assistant_message.created_at.isoformat()
+            }
+            self.redis_service.chat_add_message(session_id, user_msg)
+            self.redis_service.chat_add_message(session_id, assistant_msg)
+        
+        # Broadcast real-time chat update via WebSocket
+        if self.websocket_service:
+            try:
+                # Create a task to broadcast asynchronously
+                loop = asyncio.get_event_loop()
+                loop.create_task(self.websocket_service.broadcast_chat_message(session_id, {
+                    'message': user_query,
+                    'response': response_content,
+                    'role': 'assistant',
+                    'timestamp': assistant_message.created_at.isoformat(),
+                    'timestamp_citations': cited_timestamps,
+                    'frame_references': frame_references,
+                    'confidence': overall_confidence
+                }))
+                logger.info(f"Broadcasted chat update for session {session_id}")
+            except Exception as e:
+                logger.error(f"Error broadcasting chat update: {e}")
+        
+        return response_data
     
     def update_conversation_context(self, db: Session, session_id: int, user_query: str, 
                                   response: str, timestamps: List[Dict], frames: List[Dict]):
