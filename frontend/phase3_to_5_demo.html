@@ -95,12 +95,9 @@
 
             <!-- Existing Videos Panel -->
             <div id="existing-panel" class="video-panel">
-                <div class="flex items-center space-x-4">
-                    <select id="video-select" class="flex-1 border border-gray-300 rounded px-3 py-2">
+                <div class="flex items-center space-x-4">                    <select id="video-select" class="flex-1 border border-gray-300 rounded px-3 py-2">
                         <option value="">Select a video...</option>
-                        <option value="1">Sample Tutorial Video</option>
-                        <option value="2">Machine Learning Basics</option>
-                        <option value="3">Data Science Workshop</option>
+                        <!-- Videos will be loaded dynamically from database -->
                     </select>
                     <button onclick="loadVideo()" class="bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700">
                         Load Video
@@ -299,12 +296,129 @@
     <script>        // Application State
         let currentVideo = null;
         let chatSession = null;
-        let currentTab = 'chat';        // API Configuration
+        let currentTab = 'chat';
+        let currentVideoId = null; // Track currently selected video ID
+
+        // API Configuration
         const API_BASE = 'http://localhost:8000';
 
         // WebSocket Configuration
         let socket = null;
         let isConnected = false;
+
+        // Initialize app when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeWebSocket();
+            loadExistingVideos();
+        });
+
+        // Load existing videos from the database
+        async function loadExistingVideos() {
+            try {
+                console.log('🔍 Loading existing videos from database...');
+                const response = await fetch(`${API_BASE}/videos`);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                  const data = await response.json();
+                console.log('📹 Loaded videos:', data);
+                
+                // Store videos globally for access by other functions
+                window.allVideos = data.videos || [];
+                
+                // Update the dropdown with real videos
+                updateVideoDropdown(data.videos);
+                  } catch (error) {
+                console.error('❌ Error loading existing videos:', error);
+                // Fallback to demo data if API fails
+                const fallbackVideos = [
+                    {id: 1, original_filename: "Sample Tutorial Video", processed: true},
+                    {id: 2, original_filename: "Machine Learning Basics", processed: true},
+                    {id: 3, original_filename: "Data Science Workshop", processed: true}
+                ];
+                window.allVideos = fallbackVideos;
+                updateVideoDropdown(fallbackVideos);
+            }
+        }
+
+        // Update video dropdown with loaded videos
+        function updateVideoDropdown(videos) {
+            const select = document.getElementById('video-select');
+            
+            // Clear existing options except the first one
+            select.innerHTML = '<option value="">Select a video...</option>';
+            
+            // Add videos, prioritizing processed ones
+            const processedVideos = videos.filter(v => v.processed);
+            const unprocessedVideos = videos.filter(v => !v.processed);
+            
+            // Add processed videos first
+            processedVideos.forEach(video => {
+                const option = document.createElement('option');
+                option.value = video.id;
+                const title = video.original_filename || video.filename || `Video ${video.id}`;
+                option.textContent = `✅ ${title}`;
+                option.dataset.processed = 'true';
+                select.appendChild(option);
+            });
+            
+            // Add unprocessed videos with different styling
+            unprocessedVideos.forEach(video => {
+                const option = document.createElement('option');
+                option.value = video.id;
+                const title = video.original_filename || video.filename || `Video ${video.id}`;
+                option.textContent = `⏳ ${title} (Processing...)`;
+                option.dataset.processed = 'false';
+                option.disabled = true; // Disable unprocessed videos
+                select.appendChild(option);
+            });
+            
+            console.log(`📋 Updated dropdown with ${processedVideos.length} processed and ${unprocessedVideos.length} unprocessed videos`);
+        }
+
+        // Auto-select video by ID (used when a video is newly processed)
+        function autoSelectVideo(videoId) {
+            const select = document.getElementById('video-select');
+            const option = select.querySelector(`option[value="${videoId}"]`);
+            
+            if (option && option.dataset.processed === 'true') {
+                select.value = videoId;
+                console.log(`🎯 Auto-selected video ${videoId}`);
+                
+                // Show notification
+                showNotification(`Video ${videoId} is now ready! Auto-selected for you.`, 'success');
+                
+                // Optionally auto-load the video
+                setTimeout(() => {
+                    if (confirm(`Video ${videoId} is ready! Would you like to load it now?`)) {
+                        loadVideo();
+                    }
+                }, 1000);
+            }
+        }
+
+        // Show notification to user
+        function showNotification(message, type = 'info') {
+            // Create notification element if it doesn't exist
+            let notification = document.getElementById('notification');
+            if (!notification) {
+                notification = document.createElement('div');
+                notification.id = 'notification';
+                notification.className = 'fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 max-w-sm';
+                document.body.appendChild(notification);
+            }
+            
+            // Set styles based on type
+            const bgColor = type === 'success' ? 'bg-green-500' : type === 'error' ? 'bg-red-500' : 'bg-blue-500';
+            notification.className = `fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 max-w-sm text-white ${bgColor}`;
+            notification.textContent = message;
+            notification.style.display = 'block';
+            
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+                notification.style.display = 'none';
+            }, 5000);        }
 
         // Initialize WebSocket connection
         function initializeWebSocket() {
@@ -367,9 +481,7 @@
             if (data.session_id === chatSession?.session_id) {
                 displayChatMessage(data.message, data.sender || 'assistant');
             }
-        }
-
-        // Handle processing status updates
+        }        // Handle processing status updates
         function handleProcessingStatus(data) {
             console.log('Processing status:', data);
             showNotification(`Processing: ${data.message}`, data.status === 'error' ? 'error' : 'info');
@@ -379,7 +491,17 @@
             if (progressBar) {
                 progressBar.style.width = `${data.progress || 0}%`;
             }
-        }        // Handle visual analysis results
+            
+            // If processing is complete, reload videos and auto-select
+            if (data.status === 'completed' && data.video_id) {
+                console.log('✅ Video processing completed, refreshing video list...');
+                setTimeout(() => {
+                    loadExistingVideos().then(() => {
+                        autoSelectVideo(data.video_id);
+                    });
+                }, 2000); // Wait 2 seconds to ensure DB is updated
+            }
+        }// Handle visual analysis results
         function handleVisualAnalysis(data) {
             console.log('Visual analysis results:', data);
             if (currentTab === 'visual' && currentVideo?.id === data.video_id) {
@@ -387,41 +509,6 @@
                 displayVisualSearchResults(data.results);
                 showNotification('Visual analysis complete!', 'success');
             }
-        }
-
-        // Show notification
-        function showNotification(message, type = 'info') {
-            // Create notification element
-            const notification = document.createElement('div');
-            notification.className = `fixed top-4 right-4 z-50 p-4 rounded-lg shadow-lg max-w-sm transform transition-transform duration-300 translate-x-full`;
-            
-            // Set color based on type
-            const colors = {
-                'success': 'bg-green-500 text-white',
-                'error': 'bg-red-500 text-white',
-                'info': 'bg-blue-500 text-white',
-                'warning': 'bg-yellow-500 text-black'
-            };
-            
-            notification.className += ` ${colors[type] || colors.info}`;
-            notification.textContent = message;
-            
-            // Add to page
-            document.body.appendChild(notification);
-            
-            // Animate in
-            setTimeout(() => {
-                notification.classList.remove('translate-x-full');
-            }, 100);
-            
-            // Remove after 5 seconds
-            setTimeout(() => {
-                notification.classList.add('translate-x-full');
-                setTimeout(() => {
-                    if (notification.parentNode) {
-                        notification.parentNode.removeChild(notification);
-                    }
-                }, 300);            }, 5000);
         }
 
         // Create chat session and join WebSocket room
@@ -495,9 +582,16 @@
                     element.classList.remove('hidden');
                 }
             });
-        }
+        }        // Load video
+        async function loadVideo() {
+            const videoId = document.getElementById('video-select').value;
+            if (!videoId) {
+                alert('Please select a video');
+                return;
+            }
 
-        // Load video
+            try {
+                currentVideo = videoId;        // Load video
         async function loadVideo() {
             const videoId = document.getElementById('video-select').value;
             if (!videoId) {
@@ -508,10 +602,70 @@
             try {
                 currentVideo = videoId;
                 
-                // Show video info
+                // First try to get video data from already loaded videos
+                console.log(`🎬 Loading video ${videoId}...`);
+                let videoData = null;
+                
+                // Try to find video in the global videos cache (if we have it)
+                if (window.allVideos) {
+                    videoData = window.allVideos.find(v => v.id === parseInt(videoId));
+                }
+                
+                // If not found in cache, try individual status endpoint
+                if (!videoData) {
+                    try {
+                        const statusResponse = await fetch(`${API_BASE}/video/${videoId}/status`);
+                        if (statusResponse.ok) {
+                            const statusData = await statusResponse.json();
+                            // The status endpoint might have different structure, adapt as needed
+                            videoData = statusData.video || statusData;
+                        }
+                    } catch (statusError) {
+                        console.warn('Status endpoint failed:', statusError);
+                    }
+                }
+                
+                // Final fallback: extract from dropdown option
+                if (!videoData) {
+                    console.warn('No video data found, using fallback...');
+                    const select = document.getElementById('video-select');
+                    const selectedOption = select.querySelector(`option[value="${videoId}"]`);
+                    if (selectedOption) {
+                        const optionText = selectedOption.textContent.replace('✅ ', '').replace('⏳ ', '').replace(' (Processing...)', '');
+                        videoData = {
+                            id: parseInt(videoId),
+                            original_filename: optionText,
+                            duration: 0,
+                            processed: selectedOption.dataset.processed === 'true'
+                        };
+                    }
+                }
+                
+                // Show video info with real data
                 document.getElementById('video-info').classList.remove('hidden');
-                document.getElementById('video-title').textContent = `Video ${videoId} - Sample Tutorial`;
-                document.getElementById('video-duration').textContent = 'Duration: 5:00';
+                
+                if (videoData) {
+                    const title = videoData.original_filename || videoData.filename || `Video ${videoId}`;
+                    const duration = formatDuration(videoData.duration || 0);
+                    
+                    document.getElementById('video-title').textContent = title;
+                    document.getElementById('video-duration').textContent = `Duration: ${duration}`;
+                    
+                    // Store current video data
+                    currentVideo = {
+                        id: parseInt(videoId),
+                        title: title,
+                        duration: videoData.duration || 0,
+                        processed: videoData.processed || false
+                    };
+                    
+                    console.log(`✅ Loaded video: ${title} (${duration})`);
+                } else {
+                    // Fallback to basic display
+                    document.getElementById('video-title').textContent = `Video ${videoId}`;
+                    document.getElementById('video-duration').textContent = 'Duration: Unknown';
+                    currentVideo = { id: parseInt(videoId), title: `Video ${videoId}`, duration: 0 };
+                }
                 
                 // Create chat session
                 const response = await fetch(`${API_BASE}/chat/sessions`, {
@@ -937,13 +1091,24 @@
                     'inline-block bg-yellow-100 text-yellow-800 px-2 py-1 rounded text-sm' :
                     'inline-block bg-green-100 text-green-800 px-2 py-1 rounded text-sm';
             }
-        }
-
-        // Utility functions
+        }        // Utility functions
         function formatTimestamp(seconds) {
             const minutes = Math.floor(seconds / 60);
             const secs = Math.floor(seconds % 60);
             return `${minutes}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        function formatDuration(seconds) {
+            if (seconds === 0) return '0:00';
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = Math.floor(seconds % 60);
+            
+            if (hours > 0) {
+                return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            } else {
+                return `${minutes}:${secs.toString().padStart(2, '0')}`;
+            }
         }
 
         function jumpToTimestamp(seconds) {
